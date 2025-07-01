@@ -1,7 +1,6 @@
 
 //-------------------------
 require('dotenv').config(); // ต้องอยู่บรรทัดแรกสุด
-
 //---------------------
 const express = require('express');
 const { Pool } = require('pg');
@@ -9,13 +8,11 @@ const { Pool } = require('pg');
 const app = express();
 // PostgreSQL Connection Pool Configuration
 const pool = new Pool({
-  user: process.env.DB_USER,
-  host: process.env.DB_HOST,
-  database: process.env.DB_DATABASE,
-  password: process.env.DB_PASSWORD,
-  port: process.env.DB_PORT,
+  connectionString: process.env.DATABASE_URL, // เปลี่ยนมาใช้ DATABASE_URL
+  ssl: {
+    rejectUnauthorized: false // สำคัญสำหรับ Render/Cloud Database
+  }
 });
-
 // Test Database Connection (This part is already there)
 pool.connect((err, client, release) => {
   if (err) {
@@ -95,8 +92,6 @@ app.get('/api/menus/:id', async (req, res) => {
   }
 });
 
-
-
 app.use(express.json());
 
 // --- Existing GET / route ---
@@ -115,7 +110,7 @@ app.post('/api/order', (req, res) => {
   });
 });
 
-// --- API Endpoints สำหรับจัดการเมนู (Menus) (โค้ดที่เราสร้างไปเมื่อวานนี้) ---
+// --- API Endpoints สำหรับจัดการเมนู (Menus)
 // 1. API Endpoint สำหรับเพิ่มเมนูใหม่ (POST /api/menus)
 app.post('/api/menus', async (req, res) => {
   const { name, description, price, image_url, category, is_available } = req.body;
@@ -402,11 +397,7 @@ app.get('/api/orders/:id', async (req, res) => {
     res.status(500).json({ error: 'Failed to fetch order by ID', details: err.message });
   }
 });
-// server.js
 
-// ... (โค้ดเดิมส่วนบนทั้งหมด, express, pg, pool config, test connection, API menus, API tables, API orders) ...
-
-// ----------------------------------------------------
 // ส่วนใหม่: API Endpoint สำหรับลบออเดอร์ (DELETE /api/orders/:id)
 // ----------------------------------------------------
 app.delete('/api/orders/:id', async (req, res) => {
@@ -441,13 +432,8 @@ app.delete('/api/orders/:id', async (req, res) => {
     client.release(); // คืน client กลับสู่ pool
   }
 });
-// server.js
-
-// ... (โค้ดเดิมส่วนบนทั้งหมด เช่น require, pool config, test connection, API menus, API tables, API orders) ...
-
 // ----------------------------------------------------
 // ส่วนใหม่: API Endpoint สำหรับอัปเดตสถานะออเดอร์ (PUT /api/orders/:id/status)
-// นี่คือโค้ดที่คุณต้องเพิ่มเข้าไปใน server.js
 // ----------------------------------------------------
 app.put('/api/orders/:id/status', async (req, res) => {
   const { id } = req.params; // ID ของออเดอร์จาก URL
@@ -481,7 +467,6 @@ app.put('/api/orders/:id/status', async (req, res) => {
   }
 });
 
-// ... (โค้ดส่วนที่เหลือ เช่น app.listen) ...
 const PORT = process.env.PORT || 5000; // จะใช้ค่าจาก .env หรือ 5000 เป็นค่าเริ่มต้น
 app.listen(PORT, () => {
   console.log(`Server is running on port ${PORT}`);
