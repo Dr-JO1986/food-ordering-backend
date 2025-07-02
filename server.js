@@ -1,9 +1,9 @@
-
 //-------------------------
 require('dotenv').config(); // ต้องอยู่บรรทัดแรกสุด
 //---------------------
 const express = require('express');
 const { Pool } = require('pg');
+const cors = require('cors'); 
 
 const app = express();
 // PostgreSQL Connection Pool Configuration
@@ -13,7 +13,7 @@ const pool = new Pool({
     rejectUnauthorized: false // สำคัญสำหรับ Render/Cloud Database
   }
 });
-// Test Database Connection (This part is already there)
+// Test Database Connection
 pool.connect((err, client, release) => {
   if (err) {
     return console.error('Error acquiring client', err.stack);
@@ -27,7 +27,10 @@ pool.connect((err, client, release) => {
   });
 });
 
-app.use(express.json()); // Middleware to parse JSON request bodies
+// Middlewares ควรอยู่ตรงนี้ (หลังจาก app ถูกสร้าง และก่อน routes ทั้งหมด)
+app.use(express.json()); // <--- เหลือไว้แค่ครั้งเดียว และอยู่ที่นี่
+app.use(cors());         // <--- เพิ่มบรรทัดนี้
+
 
 // --- Existing GET / route ---
 app.get('/', (req, res) => {
@@ -91,9 +94,6 @@ app.get('/api/menus/:id', async (req, res) => {
     res.status(500).json({ error: 'Failed to fetch menu item by ID', details: err.message });
   }
 });
-
-app.use(express.json());
-
 // --- Existing GET / route ---
 app.get('/', (req, res) => {
   res.send('Welcome to My Food Ordering Backend API!');
