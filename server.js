@@ -508,6 +508,129 @@ app.get('/api/order_items/:id', async (req, res) => {
         res.status(500).json({ error: 'Failed to fetch order item by ID', details: err.message });
     }
 });
+// --- API Endpoints สำหรับ Payments ---
+
+// 1. API Endpoint สำหรับดึงข้อมูลการชำระเงินทั้งหมด (GET /api/payments)
+app.get('/api/payments', async (req, res) => {
+    try {
+        const result = await pool.query(`
+            SELECT
+                p.payment_id,
+                p.order_id,
+                o.customer_name, -- ดึงจากตาราง orders (ตรวจสอบว่ามีคอลัมน์นี้จริงใน DB)
+                o.order_time,    -- ดึงจากตาราง orders (ตรวจสอบว่ามีคอลัมน์นี้จริงใน DB)
+                p.amount,
+                p.payment_date,
+                p.payment_method,
+                p.transaction_id,
+                p.status
+            FROM payments p
+            JOIN orders o ON p.order_id = o.order_id -- เชื่อมกับตาราง orders
+            ORDER BY p.payment_date DESC
+        `);
+        res.status(200).json(result.rows);
+    } catch (err) {
+        console.error('Error fetching payments:', err.message);
+        res.status(500).json({ error: 'Failed to fetch payments', details: err.message });
+    }
+});
+
+// 2. API Endpoint สำหรับดึงข้อมูลการชำระเงินตาม ID (GET /api/payments/:id)
+app.get('/api/payments/:id', async (req, res) => {
+    const { id } = req.params; // id ในที่นี้คือ payment_id
+    try {
+        const result = await pool.query(`
+            SELECT
+                p.payment_id,
+                p.order_id,
+                o.customer_name, -- ดึงจากตาราง orders (ตรวจสอบว่ามีคอลัมน์นี้จริงใน DB)
+                o.order_time,    -- ดึงจากตาราง orders (ตรวจสอบว่ามีคอลัมน์นี้จริงใน DB)
+                p.amount,
+                p.payment_date,
+                p.payment_method,
+                p.transaction_id,
+                p.status
+            FROM payments p
+            JOIN orders o ON p.order_id = o.order_id
+            WHERE p.payment_id = $1
+        `, [id]);
+
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: 'Payment not found.' });
+        }
+        res.status(200).json(result.rows[0]);
+    } catch (err) {
+        console.error('Error fetching payment by ID:', err.message);
+        res.status(500).json({ error: 'Failed to fetch payment by ID', details: err.message });
+    }
+});
+
+// 3. API Endpoint สำหรับเพิ่มการชำระเงินใหม่ (POST /api/payments)
+app.post('/api/payments', async (req, res) => {
+    const { order_id, amount, payment_method, transaction_id, status } = req.body;
+    try {
+        // ตรวจสอบว่า order_id ที่ส่งมามีอยู่จริงในตาราง orders หรือไม่ (Optional แต่ดีต่อการป้องกันข้อมูลผิดพลาด)
+        const orderCheck = await pool.query('SELECT order_id FROM orders WHERE order_id = $1', [order_id]);
+        if (orderCheck.rows.length === 0) {
+            return res.status(400).json({ error: 'Invalid order_id.', details: 'Order does not exist.' });
+        }
+
+        const result = await pool.query(`
+            INSERT INTO payments (order_id, amount, payment_method, transaction_id, status)
+            VALUES ($1, $2, $3, $4, $5)
+            RETURNING *;
+        `, [order_id, amount, payment_method, transaction_id, status]);
+
+        res.status(201).json(result.rows[0]);
+    } catch (err) {
+        console.error('Error adding new payment:', err.message);
+        res.status(500).json({ error: 'Failed to add new payment', details: err.message });
+    }
+});
+
+// 4. API Endpoint สำหรับอัปเดตข้อมูลการชำระเงิน (PUT /api/payments/:id)
+app.put('/api/payments/:id', async (req, res) => {
+    const { id } = req.params; // id ในที่นี้คือ payment_id
+    const { order_id, amount, payment_method, transaction_id, status } = req.body;
+    try {
+        // คุณอาจจะต้องเพิ่มการตรวจสอบ order_id ที่อัปเดตคล้ายกับ POST
+        const result = await pool.query(`
+            UPDATE payments
+            SET
+                order_id = COALESCE($1, order_id), -- COALESCE ใช้เพื่อให้สามารถอัปเดตบางฟิลด์ได้
+                amount = COALESCE($2, amount),
+                payment_method = COALESCE($3, payment_method),
+                transaction_id = COALESCE($4, transaction_id),
+                status = COALESCE($5, status)
+            WHERE payment_id = $6
+            RETURNING *;
+        `, [order_id, amount, payment_method, transaction_id, status, id]);
+
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: 'Payment not found.' });
+        }
+        res.status(200).json(result.rows[0]);
+    } catch (err) {
+        console.error('Error updating payment:', err.message);
+        res.status(500).json({ error: 'Failed to update payment', details: err.message });
+    }
+});
+
+// 5. API Endpoint สำหรับลบการชำระเงิน (DELETE /api/payments/:id)
+app.delete('/api/payments/:id', async (req, res) => {
+    const { id } = req.params; // id ในที่นี้คือ payment_id
+    try {
+        const result = await pool.query('DELETE FROM payments WHERE payment_id = $1 RETURNING *;', [id]);
+
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: 'Payment not found.' });
+        }
+        res.status(200).json({ message: 'Payment deleted successfully.', deletedPayment: result.rows[0] });
+    } catch (err) {
+        console.error('Error deleting payment:', err.message);
+        res.status(500).json({ error: 'Failed to delete payment', details: err.message });
+    }
+});
 
 const PORT = process.env.PORT || 5000; // จะใช้ค่าจาก .env หรือ 5000 เป็นค่าเริ่มต้น
 app.listen(PORT, () => {
