@@ -295,7 +295,7 @@ app.delete('/api/tables/:table_id', async (req, res) => {
 //    - GET /api/orders: ดึงข้อมูลออเดอร์ทั้งหมดพร้อมรายละเอียดโต๊ะ
 //    - GET /api/orders/:order_id: ดึงข้อมูลออเดอร์ตาม ID พร้อมรายการอาหารและโต๊ะ
 //    - POST /api/orders: สร้างออเดอร์ใหม่พร้อมรายการอาหาร
-//    - PUT /api/orders/:order_id: อัปเดตข้อมูลออเดอร์ทั่วไป
+//    - PUT /api/orders/:order_id: อัปเดตข้อมูลออเดอร์ทั่วไปและรายการอาหาร (ใหม่)
 //    - PUT /api/orders/:order_id/status: อัปเดตสถานะออเดอร์
 //    - DELETE /api/orders/:order_id: ลบข้อมูลออเดอร์
 //----------------------------------------------------
@@ -454,13 +454,18 @@ app.post('/api/orders', async (req, res) => {
   }
 });
 
-// PUT: อัปเดตข้อมูลออเดอร์ทั่วไป (เช่น customer_name, table_id)
+// PUT: อัปเดตข้อมูลออเดอร์ทั่วไปและรายการอาหาร
 app.put('/api/orders/:order_id', async (req, res) => {
   const { order_id } = req.params;
-  const { table_id, customer_name, status, total_amount } = req.body; // order_time ไม่ควรอัปเดตโดยตรง
+  const { table_id, customer_name, status, total_amount, order_items } = req.body; // เพิ่ม order_items
 
+  const client = await pool.connect();
   try {
-    const result = await pool.query(`
+    await client.query('BEGIN'); // เริ่ม transaction
+
+    // 1. อัปเดตข้อมูล Order หลัก (ถ้ามีข้อมูลให้ update)
+    // ใช้ COALESCE เพื่อให้สามารถอัปเดตเฉพาะบางฟิลด์ได้
+    const updateOrderQuery = `
       UPDATE orders
       SET
         table_id = COALESCE($1, table_id),
@@ -469,15 +474,99 @@ app.put('/api/orders/:order_id', async (req, res) => {
         total_amount = COALESCE($4, total_amount)
       WHERE order_id = $5
       RETURNING *;
-    `, [table_id, customer_name, status, total_amount, order_id]);
+    `;
+    const orderResult = await client.query(updateOrderQuery, [table_id, customer_name, status, total_amount, order_id]);
 
-    if (result.rows.length === 0) {
+    if (orderResult.rows.length === 0) {
+      await client.query('ROLLBACK');
       return res.status(404).json({ error: 'Order not found for update.' });
     }
-    res.status(200).json(result.rows[0]);
+
+    let recalculatedTotalAmount = orderResult.rows[0].total_amount; // ใช้ total_amount เดิมเป็นค่าเริ่มต้น
+
+    // 2. ถ้ามีการส่ง order_items มาด้วย ให้อัปเดตรายการอาหาร
+    if (order_items !== undefined) {
+      // ลบ order_items เก่าทั้งหมดของ order นี้
+      await client.query('DELETE FROM order_items WHERE order_id = $1', [order_id]);
+
+      recalculatedTotalAmount = 0; // รีเซ็ตยอดรวมเพื่อคำนวณใหม่
+      for (const item of order_items) {
+        const { menu_id, quantity, notes } = item;
+
+        if (!menu_id || !quantity || typeof quantity !== 'number' || quantity <= 0) {
+          throw new Error(`Invalid order item in update: menu_id and positive quantity are required. Item: ${JSON.stringify(item)}`);
+        }
+
+        // ดึงราคาเมนูจากตาราง menus
+        const menuPriceResult = await client.query('SELECT price FROM menus WHERE menu_id = $1', [menu_id]);
+        if (menuPriceResult.rows.length === 0) {
+          throw new Error(`Menu item with ID ${menu_id} not found during order item update.`);
+        }
+        const priceAtOrder = menuPriceResult.rows[0].price;
+
+        // แทรก order_item ใหม่
+        await client.query(`
+          INSERT INTO order_items (order_id, menu_id, quantity, price_at_order, notes)
+          VALUES ($1, $2, $3, $4, $5);
+        `, [order_id, menu_id, quantity, priceAtOrder, notes || null]);
+
+        recalculatedTotalAmount += priceAtOrder * quantity;
+      }
+
+      // อัปเดต total_amount ใน Order หลักอีกครั้งหลังจากอัปเดต order_items
+      await client.query(
+        'UPDATE orders SET total_amount = $1 WHERE order_id = $2',
+        [recalculatedTotalAmount, order_id]
+      );
+    }
+
+    await client.query('COMMIT'); // Commit transaction
+
+    // ดึงข้อมูล order ที่อัปเดตล่าสุดพร้อมรายการอาหารเพื่อส่งกลับ
+    const updatedOrderResult = await client.query(`
+      SELECT
+        o.order_id,
+        o.customer_name,
+        o.order_time,
+        o.status,
+        o.total_amount,
+        t.table_number,
+        t.qr_code_path,
+        t.capacity,
+        t.is_occupied
+      FROM orders o
+      JOIN tables t ON o.table_id = t.table_id
+      WHERE o.order_id = $1
+    `, [order_id]);
+
+    const updatedOrder = updatedOrderResult.rows[0];
+
+    const updatedOrderItemsResult = await client.query(`
+      SELECT
+        oi.order_item_id,
+        oi.order_id,
+        oi.menu_id,
+        m.name AS menu_name,
+        m.description AS menu_description,
+        oi.quantity,
+        oi.price_at_order,
+        oi.notes
+      FROM order_items oi
+      JOIN menus m ON oi.menu_id = m.menu_id
+      WHERE oi.order_id = $1
+      ORDER BY oi.order_item_id ASC;
+    `, [order_id]);
+
+    updatedOrder.items = updatedOrderItemsResult.rows;
+
+    res.status(200).json(updatedOrder);
+
   } catch (err) {
+    await client.query('ROLLBACK'); // Rollback transaction หากเกิด error
     console.error(`Error updating order with ID ${order_id}:`, err.message);
     res.status(500).json({ error: 'Failed to update order', details: err.message });
+  } finally {
+    client.release(); // ปล่อย client กลับไปที่ pool
   }
 });
 
