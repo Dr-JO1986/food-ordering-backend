@@ -456,6 +456,58 @@ app.put('/api/orders/:id/status', async (req, res) => {
     res.status(500).json({ error: 'Failed to update order status.', details: err.message });
   }
 });
+// API Endpoint สำหรับดึงข้อมูลรายการออเดอร์ทั้งหมด (GET /api/order_items)
+// ตรวจสอบให้แน่ใจว่าอยู่ภายในไฟล์ server.js และหลังจากบรรทัด app.use(express.json()); และ app.use(cors());
+
+// API Endpoint สำหรับดึงข้อมูลรายการออเดอร์ทั้งหมด (GET /api/order_items)
+app.get('/api/order_items', async (req, res) => {
+    try {
+        const result = await pool.query(`
+            SELECT
+                oi.order_item_id,
+                oi.order_id,
+                oi.menu_id,
+                m.name AS menu_name,
+                oi.quantity,
+                oi.price_at_order
+                -- เพิ่มคอลัมน์อื่น ๆ จาก order_items หรือ menus ที่คุณต้องการ
+            FROM order_items oi
+            JOIN menus m ON oi.menu_id = m.menu_id 
+            ORDER BY oi.order_item_id DESC
+        `);
+        res.status(200).json(result.rows);
+    } catch (err) {
+        console.error('Error fetching order items:', err.message);
+        res.status(500).json({ error: 'Failed to fetch order items', details: err.message });
+    }
+});
+
+// หากคุณมี GET /api/order_items/:id ด้วย ก็เพิ่มโค้ดที่ถูกต้องเข้าไป (คล้ายกับ GET /api/orders/:id)
+app.get('/api/order_items/:id', async (req, res) => {
+    const { id } = req.params; // id ในที่นี้คือ order_item_id
+    try {
+        const result = await pool.query(`
+            SELECT
+                oi.order_item_id,
+                oi.order_id,
+                oi.menu_id,
+                m.name AS menu_name,
+                oi.quantity,
+                oi.price_at_order
+            FROM order_items oi
+            JOIN menus m ON oi.menu_id = m.menu_id
+            WHERE oi.order_item_id = $1 
+            `, [id]);
+
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: 'Order item not found.' });
+        }
+        res.status(200).json(result.rows[0]);
+    } catch (err) {
+        console.error('Error fetching order item by ID:', err.message);
+        res.status(500).json({ error: 'Failed to fetch order item by ID', details: err.message });
+    }
+});
 
 const PORT = process.env.PORT || 5000; // จะใช้ค่าจาก .env หรือ 5000 เป็นค่าเริ่มต้น
 app.listen(PORT, () => {
