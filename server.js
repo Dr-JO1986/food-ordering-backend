@@ -155,7 +155,7 @@ app.get('/api/menus/:id', async (req, res) => {
 // ส่วนใหม่: API Endpoints สำหรับจัดการโต๊ะอาหาร (Tables)
 // 1. API Endpoint สำหรับเพิ่มโต๊ะใหม่ (POST /api/tables)
 app.post('/api/tables', async (req, res) => {
-  const { table_number, qr_code_path } = req.body;
+  const { table_number, qr_code_path, capacity } = req.body;
   //-------------------------------------------ตรวจสอบ
     console.log('Received POST /api/tables request. Body:', req.body);
     console.log('Extracted capacity:', capacity);
