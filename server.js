@@ -68,6 +68,7 @@ app.get('/', (req, res) => {
 //    - GET /api/menus/:menu_id: ดึงข้อมูลเมนูตาม ID
 //    - POST /api/menus: เพิ่มเมนูใหม่
 //    - PUT /api/menus/:menu_id: อัปเดตข้อมูลเมนู
+//    - DELETE /api/menus/:menu_id: ลบข้อมูลเมนู
 //----------------------------------------------------
 
 // GET: ดึงข้อมูลเมนูทั้งหมด
@@ -148,6 +149,25 @@ app.put('/api/menus/:menu_id', async (req, res) => {
   }
 });
 
+// DELETE: ลบข้อมูลเมนู
+app.delete('/api/menus/:menu_id', async (req, res) => {
+  const { menu_id } = req.params;
+  try {
+    const result = await pool.query('DELETE FROM menus WHERE menu_id = $1 RETURNING *;', [menu_id]);
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Menu not found for deletion.' });
+    }
+    res.status(200).json({ message: 'Menu deleted successfully.', deletedMenu: result.rows[0] });
+  } catch (err) {
+    console.error(`Error deleting menu with ID ${menu_id}:`, err.message);
+    // ตรวจสอบ Foreign Key Constraint Violation (ถ้าเมนูถูกใช้อยู่ใน order_items)
+    if (err.code === '23503') { // PostgreSQL error code for foreign_key_violation
+        return res.status(409).json({ error: 'Cannot delete menu. It is associated with existing order items.', details: err.message });
+    }
+    res.status(500).json({ error: 'Failed to delete menu', details: err.message });
+  }
+});
+
 
 //----------------------------------------------------
 // 3. API Endpoints สำหรับจัดการโต๊ะ (Tables)
@@ -155,6 +175,7 @@ app.put('/api/menus/:menu_id', async (req, res) => {
 //    - GET /api/tables/:table_id: ดึงข้อมูลโต๊ะตาม ID
 //    - POST /api/tables: เพิ่มโต๊ะใหม่
 //    - PUT /api/tables/:table_id: อัปเดตข้อมูลโต๊ะ
+//    - DELETE /api/tables/:table_id: ลบข้อมูลโต๊ะ
 //----------------------------------------------------
 
 // GET: ดึงข้อมูลโต๊ะทั้งหมด
@@ -249,6 +270,25 @@ app.put('/api/tables/:table_id', async (req, res) => {
   }
 });
 
+// DELETE: ลบข้อมูลโต๊ะ
+app.delete('/api/tables/:table_id', async (req, res) => {
+  const { table_id } = req.params;
+  try {
+    const result = await pool.query('DELETE FROM tables WHERE table_id = $1 RETURNING *;', [table_id]);
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Table not found for deletion.' });
+    }
+    res.status(200).json({ message: 'Table deleted successfully.', deletedTable: result.rows[0] });
+  } catch (err) {
+    console.error(`Error deleting table with ID ${table_id}:`, err.message);
+    // ตรวจสอบ Foreign Key Constraint Violation (ถ้าโต๊ะถูกใช้อยู่ใน orders)
+    if (err.code === '23503') { // PostgreSQL error code for foreign_key_violation
+        return res.status(409).json({ error: 'Cannot delete table. It is associated with existing orders.', details: err.message });
+    }
+    res.status(500).json({ error: 'Failed to delete table', details: err.message });
+  }
+});
+
 
 //----------------------------------------------------
 // 4. API Endpoints สำหรับจัดการออเดอร์ (Orders)
@@ -257,6 +297,7 @@ app.put('/api/tables/:table_id', async (req, res) => {
 //    - POST /api/orders: สร้างออเดอร์ใหม่พร้อมรายการอาหาร
 //    - PUT /api/orders/:order_id: อัปเดตข้อมูลออเดอร์ทั่วไป
 //    - PUT /api/orders/:order_id/status: อัปเดตสถานะออเดอร์
+//    - DELETE /api/orders/:order_id: ลบข้อมูลออเดอร์
 //----------------------------------------------------
 
 // GET: ดึงข้อมูลออเดอร์ทั้งหมดพร้อมรายละเอียดโต๊ะ
@@ -466,6 +507,55 @@ app.put('/api/orders/:order_id/status', async (req, res) => {
   }
 });
 
+// DELETE: ลบข้อมูลออเดอร์
+app.delete('/api/orders/:order_id', async (req, res) => {
+  const { order_id } = req.params; // ID ของออเดอร์จาก URL
+
+  const client = await pool.connect(); // ใช้ client เพื่อทำ Transaction
+  try {
+    await client.query('BEGIN'); // เริ่ม Transaction
+
+    // 1. ลบรายการอาหารทั้งหมดที่เกี่ยวข้องกับออเดอร์นี้ในตาราง 'order_items' ก่อน
+    // เนื่องจาก order_items มี Foreign Key ไปยัง orders, ต้องลบ order_items ก่อน
+    await client.query('DELETE FROM order_items WHERE order_id = $1', [order_id]);
+
+    // 2. ลบการชำระเงินทั้งหมดที่เกี่ยวข้องกับออเดอร์นี้ในตาราง 'payments' ก่อน
+    // เนื่องจาก payments มี Foreign Key ไปยัง orders, ต้องลบ payments ก่อน
+    await client.query('DELETE FROM payments WHERE order_id = $1', [order_id]);
+
+    // 3. ลบออเดอร์หลักจากตาราง 'orders'
+    const deleteOrderResult = await client.query('DELETE FROM orders WHERE order_id = $1 RETURNING *', [order_id]);
+
+    // ถ้าไม่พบออเดอร์หลักที่มี ID นั้นใน Database
+    if (deleteOrderResult.rows.length === 0) {
+      await client.query('ROLLBACK'); // ยกเลิกการลบ order_items และ payments ที่อาจเกิดขึ้น
+      return res.status(404).json({ error: 'Order not found for deletion.' });
+    }
+
+    // (Optional) ตั้งค่า is_occupied ของโต๊ะกลับเป็น FALSE หากออเดอร์นี้เป็นออเดอร์เดียวที่โต๊ะนั้นใช้
+    // ต้องดึง table_id จาก order ที่เพิ่งลบไป
+    const tableId = deleteOrderResult.rows[0].table_id;
+    // ตรวจสอบว่ามีออเดอร์อื่นใช้ table_id นี้อยู่หรือไม่
+    const remainingOrders = await client.query('SELECT order_id FROM orders WHERE table_id = $1', [tableId]);
+    if (remainingOrders.rows.length === 0) {
+        await client.query('UPDATE tables SET is_occupied = FALSE WHERE table_id = $1', [tableId]);
+    }
+
+
+    await client.query('COMMIT'); // ยืนยัน Transaction
+
+    // ส่ง Status 200 OK พร้อมข้อความยืนยัน
+    res.status(200).json({ message: `Order with ID ${order_id} and its associated items/payments deleted successfully.` });
+
+  } catch (err) {
+    await client.query('ROLLBACK'); // ยกเลิก Transaction หากมี Error
+    console.error('Error deleting order:', err.message);
+    res.status(500).json({ error: 'Failed to delete order.', details: err.message });
+  } finally {
+    client.release(); // คืน client กลับสู่ pool
+  }
+});
+
 
 //----------------------------------------------------
 // 5. API Endpoints สำหรับจัดการรายการอาหารในออเดอร์ (Order Items)
@@ -473,6 +563,7 @@ app.put('/api/orders/:order_id/status', async (req, res) => {
 //    - GET /api/order_items/:order_item_id: ดึงข้อมูลรายการอาหารในออเดอร์ตาม ID
 //    - POST /api/order_items: เพิ่มรายการอาหารในออเดอร์ที่มีอยู่แล้ว (ถ้าจำเป็น)
 //    - PUT /api/order_items/:order_item_id: อัปเดตข้อมูลรายการอาหารในออเดอร์
+//    - DELETE /api/order_items/:order_item_id: ลบข้อมูลรายการอาหารในออเดอร์
 //----------------------------------------------------
 
 // GET: ดึงข้อมูลรายการอาหารในออเดอร์ทั้งหมด
@@ -618,7 +709,7 @@ app.put('/api/order_items/:order_item_id', async (req, res) => {
         order_id = COALESCE($1, order_id),
         menu_id = COALESCE($2, menu_id),
         quantity = COALESCE($3, quantity),
-        price_at_order = COALESCE($4, price_at_order), -- สามารถอัปเดตราคาได้ถ้าต้องการ
+        price_at_order = COALESCE($4, price_at_order), // สามารถอัปเดตราคาได้ถ้าต้องการ
         notes = COALESCE($5, notes)
       WHERE order_item_id = $6
       RETURNING *;
@@ -642,6 +733,42 @@ app.put('/api/order_items/:order_item_id', async (req, res) => {
   }
 });
 
+// DELETE: ลบข้อมูลรายการอาหารในออเดอร์
+app.delete('/api/order_items/:order_item_id', async (req, res) => {
+  const { order_item_id } = req.params;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    // ดึงข้อมูล order_item ที่จะลบเพื่ออัปเดต total_amount ของ order หลัก
+    const orderItemToDeleteResult = await client.query('SELECT order_id, quantity, price_at_order FROM order_items WHERE order_item_id = $1 FOR UPDATE', [order_item_id]);
+    if (orderItemToDeleteResult.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Order item not found for deletion.' });
+    }
+    const orderItemToDelete = orderItemToDeleteResult.rows[0];
+    const itemTotalPrice = orderItemToDelete.quantity * orderItemToDelete.price_at_order;
+
+    // ลบ order_item
+    const deleteResult = await client.query('DELETE FROM order_items WHERE order_item_id = $1 RETURNING *;', [order_item_id]);
+
+    // อัปเดต total_amount ของ order หลัก
+    await client.query(
+      'UPDATE orders SET total_amount = total_amount - ($1::NUMERIC) WHERE order_id = $2',
+      [itemTotalPrice, orderItemToDelete.order_id]
+    );
+
+    await client.query('COMMIT');
+    res.status(200).json({ message: 'Order item deleted successfully.', deletedOrderItem: deleteResult.rows[0] });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error(`Error deleting order item with ID ${order_item_id}:`, err.message);
+    res.status(500).json({ error: 'Failed to delete order item', details: err.message });
+  } finally {
+    client.release();
+  }
+});
+
 
 //----------------------------------------------------
 // 6. API Endpoints สำหรับจัดการการชำระเงิน (Payments)
@@ -649,6 +776,7 @@ app.put('/api/order_items/:order_item_id', async (req, res) => {
 //    - GET /api/payments/:payment_id: ดึงข้อมูลการชำระเงินตาม ID
 //    - POST /api/payments: บันทึกการชำระเงิน
 //    - PUT /api/payments/:payment_id: อัปเดตข้อมูลการชำระเงิน
+//    - DELETE /api/payments/:payment_id: ลบข้อมูลการชำระเงิน
 //----------------------------------------------------
 
 // GET: ดึงข้อมูลการชำระเงินทั้งหมด
@@ -751,6 +879,21 @@ app.put('/api/payments/:payment_id', async (req, res) => {
   } catch (err) {
     console.error(`Error updating payment with ID ${payment_id}:`, err.message);
     res.status(500).json({ error: 'Failed to update payment', details: err.message });
+  }
+});
+
+// DELETE: ลบข้อมูลการชำระเงิน
+app.delete('/api/payments/:payment_id', async (req, res) => {
+  const { payment_id } = req.params;
+  try {
+    const result = await pool.query('DELETE FROM payments WHERE payment_id = $1 RETURNING *;', [payment_id]);
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Payment not found for deletion.' });
+    }
+    res.status(200).json({ message: 'Payment deleted successfully.', deletedPayment: result.rows[0] });
+  } catch (err) {
+    console.error(`Error deleting payment with ID ${payment_id}:`, err.message);
+    res.status(500).json({ error: 'Failed to delete payment', details: err.message });
   }
 });
 
