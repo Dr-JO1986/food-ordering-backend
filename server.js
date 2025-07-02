@@ -156,20 +156,31 @@ app.get('/api/menus/:id', async (req, res) => {
 // 1. API Endpoint สำหรับเพิ่มโต๊ะใหม่ (POST /api/tables)
 app.post('/api/tables', async (req, res) => {
   const { table_number, qr_code_path } = req.body;
-  try {
-    const result = await pool.query(
-      'INSERT INTO tables (table_number, qr_code_path) VALUES ($1, $2) RETURNING *',
-      [table_number, qr_code_path]
-    );
-    res.status(201).json(result.rows[0]);
-  } catch (err) {
-    console.error('Error adding new table:', err.message);
-    // ตรวจสอบว่า Error เกิดจาก table_number ซ้ำหรือไม่ (UNIQUE constraint violation)
-    if (err.code === '23505') { // PostgreSQL error code for unique_violation
-      return res.status(409).json({ error: 'Table number already exists', details: err.message });
+  //-------------------------------------------ตรวจสอบ
+    console.log('Received POST /api/tables request. Body:', req.body);
+    console.log('Extracted capacity:', capacity);
+    // --- สิ้นสุดการเพิ่ม ---
+
+    // ตรวจสอบว่า capacity ถูกส่งมาหรือไม่ (ถ้ามัน NOT NULL ใน DB)
+    if (capacity === undefined || capacity === null) {
+        console.error('Capacity is missing or null in request body.'); // เพิ่ม log
+        return res.status(400).json({ error: 'Failed to add new table', details: 'Capacity is required.' });
     }
-    res.status(500).json({ error: 'Failed to add new table', details: err.message });
-  }
+  //-------------------------------------------
+try {
+        const result = await pool.query(
+            'INSERT INTO tables (table_number, qr_code_path, capacity) VALUES ($1, $2, $3) RETURNING *',
+            [table_number, qr_code_path, capacity]
+        );
+        res.status(201).json(result.rows[0]);
+    } catch (err) {
+        console.error('Error adding new table:', err.message);
+        // ตรวจสอบว่า Error เกิดจาก table_number ซ้ำหรือไม่ (UNIQUE constraint violation)
+        if (err.code === '23505') { // PostgreSQL error code for unique_violation
+            return res.status(409).json({ error: 'Table number already exists', details: err.message });
+        }
+        res.status(500).json({ error: 'Failed to add new table', details: err.message });
+    }
 });
 
 // 2. API Endpoint สำหรับดึงข้อมูลโต๊ะทั้งหมด (GET /api/tables)
@@ -187,7 +198,7 @@ app.get('/api/tables', async (req, res) => {
 app.get('/api/tables/:id', async (req, res) => {
   const { id } = req.params;
   try {
-    const result = await pool.query('SELECT * FROM tables WHERE id = $1', [id]);
+    const result = await pool.query('SELECT * FROM tables WHERE table_id = $1', [id]);
     if (result.rows.length === 0) {
       return res.status(404).json({ error: 'Table not found' });
     }
@@ -200,7 +211,7 @@ app.get('/api/tables/:id', async (req, res) => {
 
 // 4. API Endpoint สำหรับอัปเดตข้อมูลโต๊ะ (PUT /api/tables/:id)
 app.put('/api/tables/:id', async (req, res) => {
-  const { id } = req.params; // ดึงค่า ID ของโต๊ะจาก URL (เช่น /api/tables/1)
+  const { table_id } = req.params; // ดึงค่า ID ของโต๊ะจาก URL (เช่น /api/tables/1)
   const { table_number, qr_code_path } = req.body; // ดึงข้อมูลที่ต้องการอัปเดตจาก Body ของ Request
 
   // ตรวจสอบว่ามีข้อมูลที่จำเป็นครบถ้วนหรือไม่
