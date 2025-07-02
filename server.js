@@ -326,19 +326,19 @@ app.post('/api/orders', async (req, res) => {
 // ดึงข้อมูลออเดอร์พร้อมรายละเอียดโต๊ะ
 app.get('/api/orders', async (req, res) => {
     try {
-        const result = await pool.query(`
-            SELECT
-                o.order_id, // แก้ไขตรงนี้: ใช้ order_id
-                o.customer_name,
-                o.order_time,
-                o.status,
-                o.total_amount,
-                t.table_number,
-                t.capacity // เพิ่ม t.capacity หรือคอลัมน์อื่นที่เกี่ยวข้องถ้ามี
-            FROM orders o
-            JOIN tables t ON o.table_id = t.table_id // แก้ไขตรงนี้: ใช้ t.table_id
-            ORDER BY o.order_time DESC
-        `);
+       const result = await pool.query(`
+        SELECT
+            o.order_id,
+            o.customer_name,
+            o.order_time,
+            o.status,
+            o.total_amount,
+            t.table_number,
+            t.capacity
+        FROM orders o
+        JOIN tables t ON o.table_id = t.table_id
+        ORDER BY o.order_time DESC
+    `);
         res.status(200).json(result.rows);
     } catch (err) {
         console.error('Error fetching orders:', err.message);
@@ -351,44 +351,36 @@ app.get('/api/orders/:id', async (req, res) => {
     const { id } = req.params; // ตรงนี้ id คือ order_id ที่ส่งมาจาก URL
     try {
         // ดึงข้อมูล Order หลัก
+        // ส่วนดึง Order หลัก
         const orderResult = await pool.query(`
             SELECT
-                o.order_id, // แก้ไขตรงนี้: ใช้ order_id
+                o.order_id,
                 o.customer_name,
                 o.order_time,
                 o.status,
                 o.total_amount,
                 t.table_number,
-                t.capacity // หรือคอลัมน์อื่นที่เกี่ยวข้อง
+                t.capacity
             FROM orders o
-            JOIN tables t ON o.table_id = t.table_id // แก้ไขตรงนี้: ใช้ t.table_id
-            WHERE o.order_id = $1 // แก้ไขตรงนี้: ใช้ o.order_id
+            JOIN tables t ON o.table_id = t.table_id
+            WHERE o.order_id = $1 // <-- ตรวจสอบบรรทัดนี้
             `, [id]);
 
-        if (orderResult.rows.length === 0) {
-            return res.status(404).json({ error: 'Order not found.' });
-        }
-
-        const order = orderResult.rows[0];
-
-        // ดึงรายการอาหารในออเดอร์นั้น
+        // ส่วนดึง Order Items
         const orderItemsResult = await pool.query(`
             SELECT
-                oi.order_item_id, // แก้ไขตรงนี้: ใช้ order_item_id
+                oi.order_item_id,
                 oi.menu_id,
                 m.name AS menu_name,
                 m.description AS menu_description,
                 oi.quantity,
                 oi.price_at_order
-                // m.notes ถ้ามีในตาราง menus แต่ใน schema ที่ให้มาไม่มี
             FROM order_items oi
-            JOIN menus m ON oi.menu_id = m.menu_id // แก้ไขตรงนี้: ใช้ m.menu_id
-            WHERE oi.order_id = $1
-            ORDER BY oi.order_item_id // แก้ไขตรงนี้: ใช้ order_item_id
-            `, [id]); // id ในที่นี้คือ order_id จาก req.params
-
+            JOIN menus m ON oi.menu_id = m.menu_id
+            WHERE oi.order_id = $1 // <-- ตรวจสอบบรรทัดนี้
+            ORDER BY oi.order_item_id
+            `, [id]);
         order.items = orderItemsResult.rows;
-
         res.status(200).json(order);
 
     } catch (err) {
