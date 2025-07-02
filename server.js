@@ -265,10 +265,10 @@ app.post('/api/orders', async (req, res) => {
 
     // 1.1 สร้าง Order หลักในตาราง 'orders'
     const orderResult = await client.query(
-      'INSERT INTO orders (table_id, customer_name, order_time, status, total_amount) VALUES ($1, $2, NOW(), $3, $4) RETURNING id, order_time',
+      'INSERT INTO orders (table_id, customer_name, order_time, status, total_amount) VALUES ($1, $2, NOW(), $3, $4) RETURNING order_id, order_time',
       [table_id, customer_name || 'Guest', 'pending', 0] // total_amount จะคำนวณทีหลัง
     );
-    const orderId = orderResult.rows[0].id;
+    const orderId = orderResult.rows[0].order_id;
     const orderTime = orderResult.rows[0].order_time;
     let totalAmount = 0;
 
@@ -281,7 +281,7 @@ app.post('/api/orders', async (req, res) => {
       }
 
       // ดึงราคาเมนูจากตาราง 'menus'
-      const menuPriceResult = await client.query('SELECT price FROM menus WHERE id = $1', [menu_id]);
+      const menuPriceResult = await client.query('SELECT price FROM menus WHERE menu_id = $1', [menu_id]);
       if (menuPriceResult.rows.length === 0) {
         throw new Error(`Menu item with ID ${menu_id} not found.`);
       }
@@ -297,7 +297,7 @@ app.post('/api/orders', async (req, res) => {
 
     // 1.3 อัปเดต total_amount ในตาราง 'orders'
     await client.query(
-      'UPDATE orders SET total_amount = $1 WHERE id = $2',
+      'UPDATE orders SET total_amount = $1 WHERE order_id = $2',
       [totalAmount, orderId]
     );
 
