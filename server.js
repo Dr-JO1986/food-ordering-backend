@@ -363,7 +363,7 @@ app.get('/api/orders/:id', async (req, res) => {
                 t.capacity
             FROM orders o
             JOIN tables t ON o.table_id = t.table_id
-            WHERE o.order_id = $1 // <-- ตรวจสอบบรรทัดนี้
+            WHERE o.order_id = $1 
             `, [id]);
 
         // ส่วนดึง Order Items
@@ -377,7 +377,7 @@ app.get('/api/orders/:id', async (req, res) => {
                 oi.price_at_order
             FROM order_items oi
             JOIN menus m ON oi.menu_id = m.menu_id
-            WHERE oi.order_id = $1 // <-- ตรวจสอบบรรทัดนี้
+            WHERE oi.order_id = $1 
             ORDER BY oi.order_item_id
             `, [id]);
         order.items = orderItemsResult.rows;
@@ -456,8 +456,33 @@ app.put('/api/orders/:id/status', async (req, res) => {
     res.status(500).json({ error: 'Failed to update order status.', details: err.message });
   }
 });
-// API Endpoint สำหรับดึงข้อมูลรายการออเดอร์ทั้งหมด (GET /api/order_items)
-// ตรวจสอบให้แน่ใจว่าอยู่ภายในไฟล์ server.js และหลังจากบรรทัด app.use(express.json()); และ app.use(cors());
+
+app.post('/api/order_items', async (req, res) => {
+    const { order_id, menu_id, quantity, notes } = req.body; // ไม่ควรส่ง price_at_order มาจาก client โดยตรง ควรดึงจาก DB
+    try {
+        // ตรวจสอบว่า order_id และ menu_id มีอยู่จริง
+        const orderExists = await pool.query('SELECT order_id FROM orders WHERE order_id = $1', [order_id]);
+        if (orderExists.rows.length === 0) {
+            return res.status(400).json({ error: 'Invalid order_id.', details: 'Order does not exist.' });
+        }
+        const menuResult = await pool.query('SELECT price FROM menus WHERE menu_id = $1', [menu_id]);
+        if (menuResult.rows.length === 0) {
+            return res.status(400).json({ error: 'Invalid menu_id.', details: 'Menu item does not exist.' });
+        }
+        const priceAtOrder = menuResult.rows[0].price; // ดึงราคาจากเมนู
+
+        const result = await pool.query(`
+            INSERT INTO order_items (order_id, menu_id, quantity, price_at_order, notes)
+            VALUES ($1, $2, $3, $4, $5)
+            RETURNING *;
+        `, [order_id, menu_id, quantity, priceAtOrder, notes || null]);
+
+        res.status(201).json(result.rows[0]);
+    } catch (err) {
+        console.error('Error adding order item:', err.message);
+        res.status(500).json({ error: 'Failed to add order item', details: err.message });
+    }
+});
 
 // API Endpoint สำหรับดึงข้อมูลรายการออเดอร์ทั้งหมด (GET /api/order_items)
 app.get('/api/order_items', async (req, res) => {
