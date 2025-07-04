@@ -145,6 +145,9 @@ app.put('/api/menus/:menu_id', async (req, res) => {
     res.status(200).json(result.rows[0]);
   } catch (err) {
     console.error(`Error updating menu with ID ${menu_id}:`, err.message);
+    if (err.code === '23505') { // Unique constraint violation for table_number
+      return res.status(409).json({ error: 'Table number already exists.', details: err.message });
+    }
     res.status(500).json({ error: 'Failed to update menu', details: err.message });
   }
 });
@@ -352,7 +355,7 @@ app.get('/api/orders/:order_id', async (req, res) => {
 
     const order = orderResult.rows[0];
 
-    // ดึงรายการอาหารในออเดอร์นั้น
+    // ดึงรายการอาหารในออเดอร์นั้น พร้อมดึง item_status ด้วย
     const orderItemsResult = await pool.query(`
       SELECT
         oi.order_item_id,
@@ -362,7 +365,8 @@ app.get('/api/orders/:order_id', async (req, res) => {
         m.description AS menu_description,
         oi.quantity,
         oi.price_at_order,
-        oi.notes
+        oi.notes,
+        oi.item_status -- ดึง item_status ที่เพิ่มเข้ามา
       FROM order_items oi
       JOIN menus m ON oi.menu_id = m.menu_id
       WHERE oi.order_id = $1
@@ -415,11 +419,11 @@ app.post('/api/orders', async (req, res) => {
       }
       const priceAtOrder = menuPriceResult.rows[0].price;
 
-      // แทรกรายการอาหาร
+      // แทรกรายการอาหาร พร้อม item_status
       await client.query(`
-        INSERT INTO order_items (order_id, menu_id, quantity, price_at_order, notes)
-        VALUES ($1, $2, $3, $4, $5);
-      `, [orderId, menu_id, quantity, priceAtOrder, notes || null]);
+        INSERT INTO order_items (order_id, menu_id, quantity, price_at_order, notes, item_status)
+        VALUES ($1, $2, $3, $4, $5, $6);
+      `, [orderId, menu_id, quantity, priceAtOrder, notes || null, 'pending']); // กำหนด item_status เริ่มต้นเป็น 'pending'
 
       totalAmount += priceAtOrder * quantity;
     }
@@ -491,7 +495,7 @@ app.put('/api/orders/:order_id', async (req, res) => {
 
       recalculatedTotalAmount = 0; // รีเซ็ตยอดรวมเพื่อคำนวณใหม่
       for (const item of order_items) {
-        const { menu_id, quantity, notes } = item;
+        const { menu_id, quantity, notes, item_status } = item; // เพิ่ม item_status
 
         if (!menu_id || !quantity || typeof quantity !== 'number' || quantity <= 0) {
           throw new Error(`Invalid order item in update: menu_id and positive quantity are required. Item: ${JSON.stringify(item)}`);
@@ -504,11 +508,11 @@ app.put('/api/orders/:order_id', async (req, res) => {
         }
         const priceAtOrder = menuPriceResult.rows[0].price;
 
-        // แทรก order_item ใหม่
+        // แทรก order_item ใหม่ พร้อม item_status
         await client.query(`
-          INSERT INTO order_items (order_id, menu_id, quantity, price_at_order, notes)
-          VALUES ($1, $2, $3, $4, $5);
-        `, [order_id, menu_id, quantity, priceAtOrder, notes || null]);
+          INSERT INTO order_items (order_id, menu_id, quantity, price_at_order, notes, item_status)
+          VALUES ($1, $2, $3, $4, $5, $6);
+        `, [order_id, menu_id, quantity, priceAtOrder, notes || null, item_status || 'pending']); // กำหนดค่าเริ่มต้นเป็น 'pending' หากไม่ได้ระบุ
 
         recalculatedTotalAmount += priceAtOrder * quantity;
       }
@@ -550,7 +554,8 @@ app.put('/api/orders/:order_id', async (req, res) => {
         m.description AS menu_description,
         oi.quantity,
         oi.price_at_order,
-        oi.notes
+        oi.notes,
+        oi.item_status -- ดึง item_status ที่เพิ่มเข้ามา
       FROM order_items oi
       JOIN menus m ON oi.menu_id = m.menu_id
       WHERE oi.order_id = $1
@@ -652,6 +657,7 @@ app.delete('/api/orders/:order_id', async (req, res) => {
 //    - GET /api/order_items/:order_item_id: ดึงข้อมูลรายการอาหารในออเดอร์ตาม ID
 //    - POST /api/order_items: เพิ่มรายการอาหารในออเดอร์ที่มีอยู่แล้ว (ถ้าจำเป็น)
 //    - PUT /api/order_items/:order_item_id: อัปเดตข้อมูลรายการอาหารในออเดอร์
+//    - PUT /api/order_items/:order_item_id/status: อัปเดตสถานะของรายการอาหารแต่ละชิ้น (ใหม่)
 //    - DELETE /api/order_items/:order_item_id: ลบข้อมูลรายการอาหารในออเดอร์
 //----------------------------------------------------
 
@@ -667,7 +673,8 @@ app.get('/api/order_items', async (req, res) => {
         m.price AS menu_price,
         oi.quantity,
         oi.price_at_order,
-        oi.notes
+        oi.notes,
+        oi.item_status -- ดึง item_status ที่เพิ่มเข้ามา
       FROM order_items oi
       JOIN menus m ON oi.menu_id = m.menu_id
       ORDER BY oi.order_id, oi.order_item_id ASC;
@@ -692,7 +699,8 @@ app.get('/api/order_items/:order_item_id', async (req, res) => {
         m.price AS menu_price,
         oi.quantity,
         oi.price_at_order,
-        oi.notes
+        oi.notes,
+        oi.item_status -- ดึง item_status ที่เพิ่มเข้ามา
       FROM order_items oi
       JOIN menus m ON oi.menu_id = m.menu_id
       WHERE oi.order_item_id = $1;
@@ -735,12 +743,12 @@ app.post('/api/order_items', async (req, res) => {
         }
         const priceAtOrder = menuResult.rows[0].price;
 
-        // แทรกรายการอาหารใหม่
+        // แทรกรายการอาหารใหม่ พร้อม item_status
         const result = await client.query(`
-            INSERT INTO order_items (order_id, menu_id, quantity, price_at_order, notes)
-            VALUES ($1, $2, $3, $4, $5)
+            INSERT INTO order_items (order_id, menu_id, quantity, price_at_order, notes, item_status)
+            VALUES ($1, $2, $3, $4, $5, $6)
             RETURNING *;
-        `, [order_id, menu_id, quantity, priceAtOrder, notes || null]);
+        `, [order_id, menu_id, quantity, priceAtOrder, notes || null, 'pending']); // กำหนด item_status เริ่มต้นเป็น 'pending'
 
         // อัปเดต total_amount ในตาราง orders
         await client.query(
@@ -763,14 +771,14 @@ app.post('/api/order_items', async (req, res) => {
 // PUT: อัปเดตข้อมูลรายการอาหารในออเดอร์
 app.put('/api/order_items/:order_item_id', async (req, res) => {
   const { order_item_id } = req.params;
-  const { order_id, menu_id, quantity, notes } = req.body;
+  const { order_id, menu_id, quantity, notes, item_status } = req.body; // เพิ่ม item_status
 
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
 
     // ดึงข้อมูล order_item เดิมเพื่อคำนวณ total_amount ใหม่
-    const oldOrderItemResult = await client.query('SELECT order_id, menu_id, quantity, price_at_order FROM order_items WHERE order_item_id = $1 FOR UPDATE', [order_item_id]);
+    const oldOrderItemResult = await client.query('SELECT order_id, menu_id, quantity, price_at_order, item_status FROM order_items WHERE order_item_id = $1 FOR UPDATE', [order_item_id]);
     if (oldOrderItemResult.rows.length === 0) {
       await client.query('ROLLBACK');
       return res.status(404).json({ error: 'Order item not found for update.' });
@@ -799,10 +807,11 @@ app.put('/api/order_items/:order_item_id', async (req, res) => {
         menu_id = COALESCE($2, menu_id),
         quantity = COALESCE($3, quantity),
         price_at_order = COALESCE($4, price_at_order), // สามารถอัปเดตราคาได้ถ้าต้องการ
-        notes = COALESCE($5, notes)
-      WHERE order_item_id = $6
+        notes = COALESCE($5, notes),
+        item_status = COALESCE($6, item_status) -- อัปเดต item_status
+      WHERE order_item_id = $7
       RETURNING *;
-    `, [order_id, menu_id, newQuantity, newPriceAtOrder, notes, order_item_id]);
+    `, [order_id, menu_id, newQuantity, newPriceAtOrder, notes, item_status, order_item_id]);
 
     // อัปเดต total_amount ในตาราง orders
     const orderToUpdateId = order_id || oldOrderItem.order_id;
@@ -821,6 +830,33 @@ app.put('/api/order_items/:order_item_id', async (req, res) => {
     client.release();
   }
 });
+
+// PUT: อัปเดตสถานะของรายการอาหารแต่ละชิ้น
+app.put('/api/order_items/:order_item_id/status', async (req, res) => {
+    const { order_item_id } = req.params;
+    const { status } = req.body;
+
+    const validItemStatuses = ['pending', 'preparing', 'ready', 'served', 'cancelled'];
+    if (!status || !validItemStatuses.includes(status)) {
+        return res.status(400).json({ error: 'Invalid item status. Valid statuses are: ' + validItemStatuses.join(', ') });
+    }
+
+    try {
+        const result = await pool.query(
+            'UPDATE order_items SET item_status = $1 WHERE order_item_id = $2 RETURNING *',
+            [status, order_item_id]
+        );
+
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: 'Order item not found for status update.' });
+        }
+        res.status(200).json(result.rows[0]);
+    } catch (err) {
+        console.error(`Error updating order item status for ID ${order_item_id}:`, err.message);
+        res.status(500).json({ error: 'Failed to update order item status', details: err.message });
+    }
+});
+
 
 // DELETE: ลบข้อมูลรายการอาหารในออเดอร์
 app.delete('/api/order_items/:order_item_id', async (req, res) => {
@@ -850,7 +886,7 @@ app.delete('/api/order_items/:order_item_id', async (req, res) => {
     await client.query('COMMIT');
     res.status(200).json({ message: 'Order item deleted successfully.', deletedOrderItem: deleteResult.rows[0] });
   } catch (err) {
-    await client.query('ROLLBACK');
+    await client.query('ROLLback');
     console.error(`Error deleting order item with ID ${order_item_id}:`, err.message);
     res.status(500).json({ error: 'Failed to delete order item', details: err.message });
   } finally {
