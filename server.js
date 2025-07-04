@@ -892,10 +892,13 @@ app.put('/api/order_items/:order_item_id/status', async (req, res) => {
         // ถ้าไม่มีรายการอาหารที่ยังไม่เสิร์ฟหรือยกเลิกแล้ว (นั่นคือทุกรายการเสิร์ฟแล้วหรือยกเลิกแล้ว)
         if (parseInt(allItemsServedOrReady.rows[0].count) === 0) {
             // อัปเดตสถานะของออเดอร์หลักเป็น 'completed'
-            await pool.query(
-                "UPDATE orders SET status = 'completed' WHERE order_id = $1 AND status != 'completed'",
-                [orderId]
-            );
+            // NOTE: This logic might conflict with payment status.
+            // We'll rely on payment status to set order to 'completed' for finality.
+            // So, removing this auto-completion based on item status.
+            // await pool.query(
+            //     "UPDATE orders SET status = 'completed' WHERE order_id = $1 AND status != 'completed'",
+            //     [orderId]
+            // );
         }
 
         res.status(200).json(result.rows[0]);
@@ -1006,14 +1009,14 @@ app.post('/api/payments', async (req, res) => {
       RETURNING *;
     `, [order_id, amount, payment_method, transaction_id || null, status || 'completed']); // กำหนดค่าเริ่มต้น status เป็น 'completed'
 
-    // อัปเดตสถานะของออเดอร์เป็น 'completed'
-    await client.query(
-        'UPDATE orders SET status = $1 WHERE order_id = $2',
-        ['completed', order_id]
-    );
-
-    // ตั้งค่า is_occupied ของโต๊ะกลับเป็น FALSE หากออเดอร์เสร็จสมบูรณ์และจ่ายเงินแล้ว
-    await pool.query('UPDATE tables SET is_occupied = FALSE WHERE table_id = $1', [tableId]); // ใช้ pool.query ได้เลย ไม่จำเป็นต้องใช้ client ใน transaction เดียวกัน
+    // หากสถานะ payment เป็น 'completed' ให้อัปเดตสถานะ order และ table
+    if (result.rows[0].status === 'completed') {
+        await client.query(
+            'UPDATE orders SET status = $1 WHERE order_id = $2',
+            ['completed', order_id]
+        );
+        await client.query('UPDATE tables SET is_occupied = FALSE WHERE table_id = $1', [tableId]);
+    }
 
     await client.query('COMMIT'); // Commit transaction
     res.status(201).json(result.rows[0]);
@@ -1032,8 +1035,29 @@ app.put('/api/payments/:payment_id', async (req, res) => {
   const { payment_id } = req.params;
   const { order_id, amount, payment_method, transaction_id, status } = req.body;
 
+  const client = await pool.connect();
   try {
-    const result = await pool.query(`
+    await client.query('BEGIN');
+
+    // ดึงข้อมูล payment เดิมเพื่อหา order_id และ table_id
+    const oldPaymentResult = await client.query('SELECT order_id, status FROM payments WHERE payment_id = $1 FOR UPDATE', [payment_id]);
+    if (oldPaymentResult.rows.length === 0) {
+        await client.query('ROLLBACK');
+        return res.status(404).json({ error: 'Payment not found for update.' });
+    }
+    const oldPayment = oldPaymentResult.rows[0];
+    const targetOrderId = order_id || oldPayment.order_id; // ใช้ order_id ใหม่ถ้ามี หรือใช้ของเดิม
+
+    // ดึง table_id จาก order ที่เกี่ยวข้อง
+    const orderResult = await client.query('SELECT table_id FROM orders WHERE order_id = $1', [targetOrderId]);
+    if (orderResult.rows.length === 0) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: 'Associated order not found.', details: 'The order linked to this payment does not exist.' });
+    }
+    const tableId = orderResult.rows[0].table_id;
+
+    // อัปเดต payment
+    const result = await client.query(`
       UPDATE payments
       SET
         order_id = COALESCE($1, order_id),
@@ -1043,15 +1067,34 @@ app.put('/api/payments/:payment_id', async (req, res) => {
         status = COALESCE($5, status)
       WHERE payment_id = $6
       RETURNING *;
-    `, [order_id, amount, payment_method, transaction_id, status, payment_id]);
+    `, [targetOrderId, amount, payment_method, transaction_id, status, payment_id]);
 
     if (result.rows.length === 0) {
+      await client.query('ROLLBACK');
       return res.status(404).json({ error: 'Payment not found for update.' });
     }
+
+    // หากสถานะ payment ถูกเปลี่ยนเป็น 'completed' (และสถานะเดิมไม่ใช่ 'completed')
+    // ให้อัปเดตสถานะ order และ table
+    if (result.rows[0].status === 'completed' && oldPayment.status !== 'completed') {
+        await client.query(
+            'UPDATE orders SET status = $1 WHERE order_id = $2',
+            ['completed', targetOrderId]
+        );
+        await client.query('UPDATE tables SET is_occupied = FALSE WHERE table_id = $1', [tableId]);
+    }
+    // หากสถานะ payment ถูกเปลี่ยนจาก 'completed' เป็นอย่างอื่น
+    // อาจจะต้องพิจารณาเปลี่ยนสถานะ order และ table กลับ (กรณีซับซ้อน)
+    // สำหรับตอนนี้ เราจะเน้นแค่การเปลี่ยนเป็น 'completed' เท่านั้น
+
+    await client.query('COMMIT');
     res.status(200).json(result.rows[0]);
   } catch (err) {
+    await client.query('ROLLBACK');
     console.error(`Error updating payment with ID ${payment_id}:`, err.message);
     res.status(500).json({ error: 'Failed to update payment', details: err.message });
+  } finally {
+    client.release();
   }
 });
 
