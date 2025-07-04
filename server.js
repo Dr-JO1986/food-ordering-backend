@@ -677,7 +677,7 @@ app.delete('/api/orders/:order_id', async (req, res) => {
     console.error('Error deleting order:', err.message);
     res.status(500).json({ error: 'Failed to delete order.', details: err.message });
   } finally {
-    client.release(); // คืน client กลับสู่ pool
+    client.release();
   }
 });
 
@@ -1057,7 +1057,7 @@ app.put('/api/payments/:payment_id', async (req, res) => {
     const tableId = orderResult.rows[0].table_id;
 
     // อัปเดต payment
-    const result = await client.query(`
+    const result = await pool.query(`
       UPDATE payments
       SET
         order_id = COALESCE($1, order_id),
