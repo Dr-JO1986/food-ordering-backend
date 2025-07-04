@@ -9,6 +9,8 @@ require('dotenv').config();
 const express = require('express'); // Express.js สำหรับสร้าง Web API
 const { Pool } = require('pg');     // Node-Postgres สำหรับเชื่อมต่อกับ PostgreSQL
 const cors = require('cors');       // CORS Middleware สำหรับจัดการ Cross-Origin Requests
+const bcrypt = require('bcrypt');   // สำหรับเข้ารหัสรหัสผ่าน
+const jwt = require('jsonwebtoken'); // สำหรับสร้างและตรวจสอบ JSON Web Token
 
 // สร้าง Express application
 const app = express();
@@ -19,9 +21,7 @@ const app = express();
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL, // ใช้ DATABASE_URL จาก Render environment variables
   ssl: {
-    // สำคัญมากสำหรับ Render/Cloud Database: ต้องตั้งค่า rejectUnauthorized เป็น false
-    // เพื่อให้สามารถเชื่อมต่อกับ SSL certificate ของ Render ได้
-    rejectUnauthorized: false
+    rejectUnauthorized: false // สำคัญมากสำหรับ Render/Cloud Database
   }
 });
 
@@ -30,48 +30,158 @@ const pool = new Pool({
 //----------------------------------------------------
 pool.connect((err, client, release) => {
   if (err) {
-    // หากเกิดข้อผิดพลาดในการเชื่อมต่อ client จาก pool
     return console.error('Error acquiring client from pool', err.stack);
   }
-  // รัน Query ง่ายๆ เพื่อทดสอบการเชื่อมต่อ
   client.query('SELECT NOW()', (err, result) => {
-    release(); // ปล่อย client กลับไปที่ pool ทันทีหลังจากใช้งานเสร็จ
+    release();
     if (err) {
-      // หากเกิดข้อผิดพลาดในการรัน Query ทดสอบ
       return console.error('Error executing database test query', err.stack);
     }
-    // แสดงข้อความยืนยันการเชื่อมต่อสำเร็จ
     console.log('Database connected successfully! Current time from DB:', result.rows[0].now);
   });
 });
 
 //----------------------------------------------------
-// Middlewares: ควรอยู่ตรงนี้ (หลังจาก app ถูกสร้าง และก่อน routes ทั้งหมด)
+// Middlewares
 //----------------------------------------------------
-// Middleware สำหรับ parse JSON request bodies (เช่น ข้อมูลที่ส่งมากับ POST/PUT requests)
 app.use(express.json());
-// Middleware สำหรับเปิดใช้งาน CORS (Cross-Origin Resource Sharing)
-// อนุญาตให้ Front-end ที่อยู่คนละ Domain สามารถเรียก API นี้ได้
 app.use(cors());
+
+//----------------------------------------------------
+// JWT Secret Key
+//----------------------------------------------------
+const JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET) {
+    console.error('FATAL ERROR: JWT_SECRET is not defined. Please set it in your .env file or environment variables.');
+    process.exit(1); // หยุดการทำงานของ Server ถ้าไม่มี JWT_SECRET
+}
+
+//----------------------------------------------------
+// Authentication Middleware
+//----------------------------------------------------
+/**
+ * Middleware สำหรับตรวจสอบ JWT และแนบข้อมูลผู้ใช้ (user_id, role) เข้าไปใน req
+ * @param {object} req - Request object
+ * @param {object} res - Response object
+ * @param {function} next - Next middleware function
+ */
+function authenticateToken(req, res, next) {
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1]; // Bearer TOKEN
+
+    if (token == null) {
+        return res.status(401).json({ error: 'Access Denied', details: 'No token provided.' });
+    }
+
+    jwt.verify(token, JWT_SECRET, (err, user) => {
+        if (err) {
+            console.error('JWT verification failed:', err.message);
+            return res.status(403).json({ error: 'Access Denied', details: 'Invalid or expired token.' });
+        }
+        req.user = user; // เก็บข้อมูลผู้ใช้ (user_id, role) ไว้ใน req.user
+        next();
+    });
+}
+
+/**
+ * Middleware สำหรับตรวจสอบบทบาทของผู้ใช้
+ * @param {Array<string>} allowedRoles - Array ของบทบาทที่ได้รับอนุญาต (เช่น ['owner', 'chef'])
+ */
+function authorizeRoles(allowedRoles) {
+    return (req, res, next) => {
+        if (!req.user || !allowedRoles.includes(req.user.role)) {
+            return res.status(403).json({ error: 'Forbidden', details: 'You do not have permission to perform this action.' });
+        }
+        next();
+    };
+}
 
 //----------------------------------------------------
 // 1. Root Route
 //----------------------------------------------------
-// Endpoint สำหรับหน้าแรกของ API
 app.get('/', (req, res) => {
   res.send('Welcome to My Food Ordering Backend API!');
 });
 
 //----------------------------------------------------
-// 2. API Endpoints สำหรับจัดการเมนู (Menus)
-//    - GET /api/menus: ดึงข้อมูลเมนูทั้งหมด
-//    - GET /api/menus/:menu_id: ดึงข้อมูลเมนูตาม ID
-//    - POST /api/menus: เพิ่มเมนูใหม่
-//    - PUT /api/menus/:menu_id: อัปเดตข้อมูลเมนู
-//    - DELETE /api/menus/:menu_id: ลบข้อมูลเมนู
+// 2. API Endpoints สำหรับจัดการผู้ใช้ (Users) - New Section
+//    - POST /api/register: สมัครสมาชิกใหม่ (สำหรับทดสอบ/Admin)
+//    - POST /api/login: เข้าสู่ระบบ
 //----------------------------------------------------
 
-// GET: ดึงข้อมูลเมนูทั้งหมด
+// POST: สมัครสมาชิกใหม่ (สำหรับทดสอบหรือ Admin สร้างผู้ใช้)
+app.post('/api/register', async (req, res) => {
+    const { username, password, role } = req.body;
+
+    if (!username || !password || !role) {
+        return res.status(400).json({ error: 'Username, password, and role are required.' });
+    }
+    if (!['owner', 'chef', 'waiter'].includes(role)) {
+        return res.status(400).json({ error: 'Invalid role. Must be owner, chef, or waiter.' });
+    }
+
+    try {
+        const hashedPassword = await bcrypt.hash(password, 10); // เข้ารหัสรหัสผ่าน
+        const result = await pool.query(
+            'INSERT INTO users (username, password_hash, role) VALUES ($1, $2, $3) RETURNING user_id, username, role;',
+            [username, hashedPassword, role]
+        );
+        res.status(201).json({ message: 'User registered successfully', user: result.rows[0] });
+    } catch (err) {
+        console.error('Error registering user:', err.message);
+        if (err.code === '23505') { // Unique constraint violation (username already exists)
+            return res.status(409).json({ error: 'Username already exists.', details: err.message });
+        }
+        res.status(500).json({ error: 'Failed to register user', details: err.message });
+    }
+});
+
+// POST: เข้าสู่ระบบ
+app.post('/api/login', async (req, res) => {
+    const { username, password } = req.body;
+
+    if (!username || !password) {
+        return res.status(400).json({ error: 'Username and password are required.' });
+    }
+
+    try {
+        const result = await pool.query('SELECT * FROM users WHERE username = $1', [username]);
+        const user = result.rows[0];
+
+        if (!user) {
+            return res.status(400).json({ error: 'Invalid credentials.', details: 'User not found.' });
+        }
+
+        const isPasswordValid = await bcrypt.compare(password, user.password_hash);
+        if (!isPasswordValid) {
+            return res.status(400).json({ error: 'Invalid credentials.', details: 'Incorrect password.' });
+        }
+
+        // สร้าง JWT
+        const token = jwt.sign(
+            { user_id: user.user_id, username: user.username, role: user.role },
+            JWT_SECRET,
+            { expiresIn: '1h' } // Token จะหมดอายุใน 1 ชั่วโมง
+        );
+
+        res.status(200).json({ message: 'Login successful', token, role: user.role, username: user.username });
+    } catch (err) {
+        console.error('Error during login:', err.message);
+        res.status(500).json({ error: 'Login failed', details: err.message });
+    }
+});
+
+
+//----------------------------------------------------
+// 3. API Endpoints สำหรับจัดการเมนู (Menus)
+//    - GET /api/menus: ดึงข้อมูลเมนูทั้งหมด
+//    - GET /api/menus/:menu_id: ดึงข้อมูลเมนูตาม ID
+//    - POST /api/menus: เพิ่มเมนูใหม่ (Owner only)
+//    - PUT /api/menus/:menu_id: อัปเดตข้อมูลเมนู (Owner only)
+//    - DELETE /api/menus/:menu_id: ลบข้อมูลเมนู (Owner only)
+//----------------------------------------------------
+
+// GET: ดึงข้อมูลเมนูทั้งหมด (ทุกคนเข้าถึงได้)
 app.get('/api/menus', async (req, res) => {
   try {
     const result = await pool.query('SELECT * FROM menus ORDER BY menu_id ASC');
@@ -82,9 +192,9 @@ app.get('/api/menus', async (req, res) => {
   }
 });
 
-// GET: ดึงข้อมูลเมนูตาม ID
+// GET: ดึงข้อมูลเมนูตาม ID (ทุกคนเข้าถึงได้)
 app.get('/api/menus/:menu_id', async (req, res) => {
-  const { menu_id } = req.params; // ดึงค่า menu_id จาก URL parameters
+  const { menu_id } = req.params;
   try {
     const result = await pool.query('SELECT * FROM menus WHERE menu_id = $1', [menu_id]);
     if (result.rows.length === 0) {
@@ -97,11 +207,10 @@ app.get('/api/menus/:menu_id', async (req, res) => {
   }
 });
 
-// POST: เพิ่มเมนูใหม่
-app.post('/api/menus', async (req, res) => {
+// POST: เพิ่มเมนูใหม่ (เฉพาะ Owner)
+app.post('/api/menus', authenticateToken, authorizeRoles(['owner']), async (req, res) => {
   const { name, description, price, image_url, category, is_available } = req.body;
 
-  // ตรวจสอบข้อมูลที่จำเป็น (name และ price)
   if (!name || price === undefined || price === null) {
       return res.status(400).json({ error: 'Name and price are required.' });
   }
@@ -120,8 +229,8 @@ app.post('/api/menus', async (req, res) => {
   }
 });
 
-// PUT: อัปเดตข้อมูลเมนู
-app.put('/api/menus/:menu_id', async (req, res) => {
+// PUT: อัปเดตข้อมูลเมนู (เฉพาะ Owner)
+app.put('/api/menus/:menu_id', authenticateToken, authorizeRoles(['owner']), async (req, res) => {
   const { menu_id } = req.params;
   const { name, description, price, image_url, category, is_available } = req.body;
 
@@ -145,15 +254,15 @@ app.put('/api/menus/:menu_id', async (req, res) => {
     res.status(200).json(result.rows[0]);
   } catch (err) {
     console.error(`Error updating menu with ID ${menu_id}:`, err.message);
-    if (err.code === '23505') { // Unique constraint violation for table_number
+    if (err.code === '23505') {
       return res.status(409).json({ error: 'Table number already exists.', details: err.message });
     }
     res.status(500).json({ error: 'Failed to update menu', details: err.message });
   }
 });
 
-// DELETE: ลบข้อมูลเมนู
-app.delete('/api/menus/:menu_id', async (req, res) => {
+// DELETE: ลบข้อมูลเมนู (เฉพาะ Owner)
+app.delete('/api/menus/:menu_id', authenticateToken, authorizeRoles(['owner']), async (req, res) => {
   const { menu_id } = req.params;
   try {
     const result = await pool.query('DELETE FROM menus WHERE menu_id = $1 RETURNING *;', [menu_id]);
@@ -163,8 +272,7 @@ app.delete('/api/menus/:menu_id', async (req, res) => {
     res.status(200).json({ message: 'Menu deleted successfully.', deletedMenu: result.rows[0] });
   } catch (err) {
     console.error(`Error deleting menu with ID ${menu_id}:`, err.message);
-    // ตรวจสอบ Foreign Key Constraint Violation (ถ้าเมนูถูกใช้อยู่ใน order_items)
-    if (err.code === '23503') { // PostgreSQL error code for foreign_key_violation
+    if (err.code === '23503') {
         return res.status(409).json({ error: 'Cannot delete menu. It is associated with existing order items.', details: err.message });
     }
     res.status(500).json({ error: 'Failed to delete menu', details: err.message });
@@ -173,18 +281,25 @@ app.delete('/api/menus/:menu_id', async (req, res) => {
 
 
 //----------------------------------------------------
-// 3. API Endpoints สำหรับจัดการโต๊ะ (Tables)
-//    - GET /api/tables: ดึงข้อมูลโต๊ะทั้งหมด
-//    - GET /api/tables/:table_id: ดึงข้อมูลโต๊ะตาม ID
-//    - POST /api/tables: เพิ่มโต๊ะใหม่
-//    - PUT /api/tables/:table_id: อัปเดตข้อมูลโต๊ะ
-//    - DELETE /api/tables/:table_id: ลบข้อมูลโต๊ะ
+// 4. API Endpoints สำหรับจัดการโต๊ะ (Tables)
+//    - GET /api/tables: ดึงข้อมูลโต๊ะทั้งหมด (ทุกคนเข้าถึงได้)
+//    - GET /api/tables/:table_id: ดึงข้อมูลโต๊ะตาม ID (ทุกคนเข้าถึงได้)
+//    - POST /api/tables: เพิ่มโต๊ะใหม่ (Owner only)
+//    - PUT /api/tables/:table_id: อัปเดตข้อมูลโต๊ะ (Owner only)
+//    - DELETE /api/tables/:table_id: ลบข้อมูลโต๊ะ (Owner only)
 //----------------------------------------------------
 
-// GET: ดึงข้อมูลโต๊ะทั้งหมด
+// GET: ดึงข้อมูลโต๊ะทั้งหมด (ทุกคนเข้าถึงได้)
 app.get('/api/tables', async (req, res) => {
   try {
-    const result = await pool.query('SELECT * FROM tables ORDER BY table_id ASC');
+    const result = await pool.query(`
+      SELECT 
+          t.*, 
+          o.customer_name AS current_customer_name 
+      FROM tables t
+      LEFT JOIN orders o ON t.current_order_id = o.order_id
+      ORDER BY t.table_id ASC;
+    `);
     res.status(200).json(result.rows);
   } catch (err) {
     console.error('Error fetching tables:', err.message);
@@ -192,11 +307,18 @@ app.get('/api/tables', async (req, res) => {
   }
 });
 
-// GET: ดึงข้อมูลโต๊ะตาม ID
+// GET: ดึงข้อมูลโต๊ะตาม ID (ทุกคนเข้าถึงได้)
 app.get('/api/tables/:table_id', async (req, res) => {
-  const { table_id } = req.params; // ใช้ table_id
+  const { table_id } = req.params;
   try {
-    const result = await pool.query('SELECT * FROM tables WHERE table_id = $1', [table_id]);
+    const result = await pool.query(`
+      SELECT 
+          t.*, 
+          o.customer_name AS current_customer_name 
+      FROM tables t
+      LEFT JOIN orders o ON t.current_order_id = o.order_id
+      WHERE t.table_id = $1;
+    `, [table_id]);
     if (result.rows.length === 0) {
       return res.status(404).json({ error: 'Table not found.' });
     }
@@ -207,43 +329,34 @@ app.get('/api/tables/:table_id', async (req, res) => {
   }
 });
 
-// POST: เพิ่มโต๊ะใหม่
-app.post('/api/tables', async (req, res) => {
+// POST: เพิ่มโต๊ะใหม่ (เฉพาะ Owner)
+app.post('/api/tables', authenticateToken, authorizeRoles(['owner']), async (req, res) => {
   const { table_number, qr_code_path, capacity } = req.body;
 
-  // เพิ่ม console.log เพื่อ debug ค่าที่ได้รับ
-  console.log('Received POST /api/tables request. Body:', req.body);
-  console.log('Extracted table_number:', table_number, 'qr_code_path:', qr_code_path, 'capacity:', capacity);
-
-  // ตรวจสอบค่าที่จำเป็นสำหรับคอลัมน์ NOT NULL ใน DB (จาก DDL และ pgAdmin)
   if (table_number === undefined || table_number === null || typeof table_number !== 'number') {
-      console.error('Validation Error: table_number is required and must be a number.');
       return res.status(400).json({ error: 'Failed to add new table', details: 'Table number is required and must be a number.' });
   }
   if (capacity === undefined || capacity === null || typeof capacity !== 'number') {
-      console.error('Validation Error: capacity is required and must be a number.');
       return res.status(400).json({ error: 'Failed to add new table', details: 'Capacity is required and must be a number.' });
   }
-  // qr_code_path ไม่ใช่ NOT NULL (จาก pgAdmin) จึงสามารถเป็น null ได้
 
   try {
     const result = await pool.query(
       'INSERT INTO tables (table_number, qr_code_path, capacity) VALUES ($1, $2, $3) RETURNING *',
-      [table_number, qr_code_path || null, capacity] // ส่ง null ถ้า qr_code_path ไม่ได้ให้มา
+      [table_number, qr_code_path || null, capacity]
     );
     res.status(201).json(result.rows[0]);
   } catch (err) {
     console.error('Error adding new table:', err.message);
-    // ตรวจสอบว่า Error เกิดจาก table_number ซ้ำหรือไม่ (UNIQUE constraint violation)
-    if (err.code === '23505') { // '23505' คือ PostgreSQL error code สำหรับ unique_violation
+    if (err.code === '23505') {
         return res.status(409).json({ error: 'Table number already exists', details: err.message });
     }
     res.status(500).json({ error: 'Failed to add new table', details: err.message });
   }
 });
 
-// PUT: อัปเดตข้อมูลโต๊ะ
-app.put('/api/tables/:table_id', async (req, res) => {
+// PUT: อัปเดตข้อมูลโต๊ะ (เฉพาะ Owner)
+app.put('/api/tables/:table_id', authenticateToken, authorizeRoles(['owner']), async (req, res) => {
   const { table_id } = req.params;
   const { table_number, qr_code_path, capacity, is_occupied, current_order_id } = req.body;
 
@@ -266,15 +379,15 @@ app.put('/api/tables/:table_id', async (req, res) => {
     res.status(200).json(result.rows[0]);
   } catch (err) {
     console.error(`Error updating table with ID ${table_id}:`, err.message);
-    if (err.code === '23505') { // Unique constraint violation for table_number
+    if (err.code === '23505') {
       return res.status(409).json({ error: 'Table number already exists.', details: err.message });
     }
     res.status(500).json({ error: 'Failed to update table', details: err.message });
   }
 });
 
-// DELETE: ลบข้อมูลโต๊ะ
-app.delete('/api/tables/:table_id', async (req, res) => {
+// DELETE: ลบข้อมูลโต๊ะ (เฉพาะ Owner)
+app.delete('/api/tables/:table_id', authenticateToken, authorizeRoles(['owner']), async (req, res) => {
   const { table_id } = req.params;
   try {
     const result = await pool.query('DELETE FROM tables WHERE table_id = $1 RETURNING *;', [table_id]);
@@ -284,8 +397,7 @@ app.delete('/api/tables/:table_id', async (req, res) => {
     res.status(200).json({ message: 'Table deleted successfully.', deletedTable: result.rows[0] });
   } catch (err) {
     console.error(`Error deleting table with ID ${table_id}:`, err.message);
-    // ตรวจสอบ Foreign Key Constraint Violation (ถ้าโต๊ะถูกใช้อยู่ใน orders)
-    if (err.code === '23503') { // PostgreSQL error code for foreign_key_violation
+    if (err.code === '23503') {
         return res.status(409).json({ error: 'Cannot delete table. It is associated with existing orders.', details: err.message });
     }
     res.status(500).json({ error: 'Failed to delete table', details: err.message });
@@ -294,33 +406,33 @@ app.delete('/api/tables/:table_id', async (req, res) => {
 
 
 //----------------------------------------------------
-// 4. API Endpoints สำหรับจัดการออเดอร์ (Orders)
-//    - GET /api/orders: ดึงข้อมูลออเดอร์ทั้งหมดพร้อมรายละเอียดโต๊ะ
-//    - GET /api/orders/:order_id: ดึงข้อมูลออเดอร์ตาม ID พร้อมรายการอาหารและโต๊ะ
-//    - POST /api/orders: สร้างออเดอร์ใหม่พร้อมรายการอาหาร
-//    - PUT /api/orders/:order_id: อัปเดตข้อมูลออเดอร์ทั่วไป
-//    - PUT /api/orders/:order_id/status: อัปเดตสถานะออเดอร์
-//    - PUT /api/orders/:order_id/bill_request: อัปเดตสถานะการเรียกบิล (ใหม่)
-//    - DELETE /api/orders/:order_id: ลบข้อมูลออเดอร์
+// 5. API Endpoints สำหรับจัดการออเดอร์ (Orders)
+//    - GET /api/orders: ดึงข้อมูลออเดอร์ทั้งหมดพร้อมรายละเอียดโต๊ะ (Owner, Chef, Waiter)
+//    - GET /api/orders/:order_id: ดึงข้อมูลออเดอร์ตาม ID พร้อมรายการอาหารและโต๊ะ (Owner, Chef, Waiter)
+//    - POST /api/orders: สร้างออเดอร์ใหม่พร้อมรายการอาหาร (ทุกคนเข้าถึงได้ - ลูกค้า)
+//    - PUT /api/orders/:order_id: อัปเดตข้อมูลออเดอร์ทั่วไป (Owner, Waiter)
+//    - PUT /api/orders/:order_id/status: อัปเดตสถานะออเดอร์ (Owner, Waiter)
+//    - PUT /api/orders/:order_id/bill_request: อัปเดตสถานะการเรียกบิล (Waiter)
+//    - DELETE /api/orders/:order_id: ลบข้อมูลออเดอร์ (Owner only)
 //----------------------------------------------------
 
-// GET: ดึงข้อมูลออเดอร์ทั้งหมดพร้อมรายละเอียดโต๊ะ
-app.get('/api/orders', async (req, res) => {
+// GET: ดึงข้อมูลออเดอร์ทั้งหมดพร้อมรายละเอียดโต๊ะ (Owner, Chef, Waiter)
+app.get('/api/orders', authenticateToken, authorizeRoles(['owner', 'chef', 'waiter']), async (req, res) => {
   try {
     const result = await pool.query(`
       SELECT
-        o.order_id,          -- ใช้ order_id เป็น Primary Key
+        o.order_id,
         o.customer_name,
         o.order_time,
         o.status,
         o.total_amount,
-        o.bill_requested,    -- ดึง bill_requested ด้วย
+        o.bill_requested,
         t.table_number,
         t.qr_code_path,
         t.capacity,
         t.is_occupied
       FROM orders o
-      JOIN tables t ON o.table_id = t.table_id -- เชื่อมด้วย table_id
+      JOIN tables t ON o.table_id = t.table_id
       ORDER BY o.order_time DESC;
     `);
     res.status(200).json(result.rows);
@@ -330,11 +442,10 @@ app.get('/api/orders', async (req, res) => {
   }
 });
 
-// GET: ดึงข้อมูลออเดอร์ตาม ID พร้อมรายการอาหารและโต๊ะ
-app.get('/api/orders/:order_id', async (req, res) => {
-  const { order_id } = req.params; // ใช้ order_id จาก URL parameters
+// GET: ดึงข้อมูลออเดอร์ตาม ID พร้อมรายการอาหารและโต๊ะ (Owner, Chef, Waiter)
+app.get('/api/orders/:order_id', authenticateToken, authorizeRoles(['owner', 'chef', 'waiter']), async (req, res) => {
+  const { order_id } = req.params;
   try {
-    // ดึงข้อมูล Order หลัก
     const orderResult = await pool.query(`
       SELECT
         o.order_id,
@@ -342,7 +453,7 @@ app.get('/api/orders/:order_id', async (req, res) => {
         o.order_time,
         o.status,
         o.total_amount,
-        o.bill_requested,    -- ดึง bill_requested ด้วย
+        o.bill_requested,
         t.table_number,
         t.qr_code_path,
         t.capacity,
@@ -358,7 +469,6 @@ app.get('/api/orders/:order_id', async (req, res) => {
 
     const order = orderResult.rows[0];
 
-    // ดึงรายการอาหารในออเดอร์นั้น พร้อมดึง item_status ด้วย
     const orderItemsResult = await pool.query(`
       SELECT
         oi.order_item_id,
@@ -376,7 +486,6 @@ app.get('/api/orders/:order_id', async (req, res) => {
       ORDER BY oi.order_item_id ASC;
     `, [order_id]);
 
-    // รวมข้อมูล Order หลักและรายการอาหารเข้าด้วยกัน
     order.items = orderItemsResult.rows;
 
     res.status(200).json(order);
@@ -386,28 +495,25 @@ app.get('/api/orders/:order_id', async (req, res) => {
   }
 });
 
-// POST: สร้างออเดอร์ใหม่ (พร้อมรายการอาหาร)
+// POST: สร้างออเดอร์ใหม่ (ลูกค้าเข้าถึงได้โดยไม่ต้อง Login)
 app.post('/api/orders', async (req, res) => {
-  const { table_id, customer_name, order_items } = req.body; // order_items เป็น array ของ { menu_id, quantity, notes }
+  const { table_id, customer_name, order_items } = req.body;
 
-  // ตรวจสอบค่าที่จำเป็น
   if (!table_id || !Array.isArray(order_items) || order_items.length === 0) {
       return res.status(400).json({ error: 'Table ID and order items are required.' });
   }
 
-  const client = await pool.connect(); // ใช้ transaction เพื่อความสมบูรณ์ของข้อมูล
+  const client = await pool.connect();
   try {
-    await client.query('BEGIN'); // เริ่ม transaction
+    await client.query('BEGIN');
 
-    // 1. สร้าง Order หลัก
     const orderResult = await client.query(
       'INSERT INTO orders (table_id, customer_name, order_time, status, total_amount, bill_requested) VALUES ($1, $2, NOW(), $3, $4, $5) RETURNING order_id, order_time',
-      [table_id, customer_name || 'Guest', 'pending', 0, false] // bill_requested เริ่มต้นเป็น false
+      [table_id, customer_name || 'Guest', 'pending', 0, false]
     );
     const orderId = orderResult.rows[0].order_id;
     let totalAmount = 0;
 
-    // 2. เพิ่มรายการ Order Items
     for (const item of order_items) {
       const { menu_id, quantity, notes } = item;
 
@@ -415,35 +521,32 @@ app.post('/api/orders', async (req, res) => {
           throw new Error(`Invalid order item: menu_id and positive quantity are required. Item: ${JSON.stringify(item)}`);
       }
 
-      // ดึงราคาเมนูจากตาราง menus
       const menuPriceResult = await client.query('SELECT price FROM menus WHERE menu_id = $1', [menu_id]);
       if (menuPriceResult.rows.length === 0) {
         throw new Error(`Menu item with ID ${menu_id} not found.`);
       }
       const priceAtOrder = menuPriceResult.rows[0].price;
 
-      // แทรกรายการอาหาร พร้อม item_status
       await client.query(`
         INSERT INTO order_items (order_id, menu_id, quantity, price_at_order, notes, item_status)
         VALUES ($1, $2, $3, $4, $5, $6);
-      `, [orderId, menu_id, quantity, priceAtOrder, notes || null, 'pending']); // กำหนด item_status เริ่มต้นเป็น 'pending'
+      `, [orderId, menu_id, quantity, priceAtOrder, notes || null, 'pending']);
 
       totalAmount += priceAtOrder * quantity;
     }
 
-    // 3. อัปเดต total_amount ใน Order หลัก
     await client.query(
       'UPDATE orders SET total_amount = $1 WHERE order_id = $2',
       [totalAmount, orderId]
     );
 
-    // 4. (Optional) ตั้งค่า is_occupied ของโต๊ะเป็น true เมื่อมีการสร้างออเดอร์
+    // อัปเดต current_order_id ด้วย
     await client.query(
-        'UPDATE tables SET is_occupied = TRUE WHERE table_id = $1',
-        [table_id]
+        'UPDATE tables SET is_occupied = TRUE, current_order_id = $1 WHERE table_id = $2',
+        [orderId, table_id]
     );
 
-    await client.query('COMMIT'); // Commit transaction
+    await client.query('COMMIT');
 
     res.status(201).json({
       message: 'Order created successfully!',
@@ -453,25 +556,23 @@ app.post('/api/orders', async (req, res) => {
     });
 
   } catch (err) {
-    await client.query('ROLLBACK'); // Rollback transaction หากเกิด error
+    await client.query('ROLLBACK');
     console.error('Error creating order:', err.message);
     res.status(500).json({ error: 'Failed to create order', details: err.message });
   } finally {
-    client.release(); // ปล่อย client กลับไปที่ pool
+    client.release();
   }
 });
 
-// PUT: อัปเดตข้อมูลออเดอร์ทั่วไปและรายการอาหาร
-app.put('/api/orders/:order_id', async (req, res) => {
+// PUT: อัปเดตข้อมูลออเดอร์ทั่วไปและรายการอาหาร (Owner, Waiter)
+app.put('/api/orders/:order_id', authenticateToken, authorizeRoles(['owner', 'waiter']), async (req, res) => {
   const { order_id } = req.params;
-  const { table_id, customer_name, status, total_amount, order_items, bill_requested } = req.body; // เพิ่ม order_items และ bill_requested
+  const { table_id, customer_name, status, total_amount, order_items, bill_requested } = req.body;
 
   const client = await pool.connect();
   try {
-    await client.query('BEGIN'); // เริ่ม transaction
+    await client.query('BEGIN');
 
-    // 1. อัปเดตข้อมูล Order หลัก (ถ้ามีข้อมูลให้ update)
-    // ใช้ COALESCE เพื่อให้สามารถอัปเดตเฉพาะบางฟิลด์ได้
     const updateOrderQuery = `
       UPDATE orders
       SET
@@ -479,7 +580,7 @@ app.put('/api/orders/:order_id', async (req, res) => {
         customer_name = COALESCE($2, customer_name),
         status = COALESCE($3, status),
         total_amount = COALESCE($4, total_amount),
-        bill_requested = COALESCE($5, bill_requested) -- อัปเดต bill_requested
+        bill_requested = COALESCE($5, bill_requested)
       WHERE order_id = $6
       RETURNING *;
     `;
@@ -490,47 +591,41 @@ app.put('/api/orders/:order_id', async (req, res) => {
       return res.status(404).json({ error: 'Order not found for update.' });
     }
 
-    let recalculatedTotalAmount = orderResult.rows[0].total_amount; // ใช้ total_amount เดิมเป็นค่าเริ่มต้น
+    let recalculatedTotalAmount = orderResult.rows[0].total_amount;
 
-    // 2. ถ้ามีการส่ง order_items มาด้วย ให้อัปเดตรายการอาหาร
     if (order_items !== undefined) {
-      // ลบ order_items เก่าทั้งหมดของ order นี้
       await client.query('DELETE FROM order_items WHERE order_id = $1', [order_id]);
 
-      recalculatedTotalAmount = 0; // รีเซ็ตยอดรวมเพื่อคำนวณใหม่
+      recalculatedTotalAmount = 0;
       for (const item of order_items) {
-        const { menu_id, quantity, notes, item_status } = item; // เพิ่ม item_status
+        const { menu_id, quantity, notes, item_status } = item;
 
         if (!menu_id || !quantity || typeof quantity !== 'number' || quantity <= 0) {
           throw new Error(`Invalid order item in update: menu_id and positive quantity are required. Item: ${JSON.stringify(item)}`);
         }
 
-        // ดึงราคาเมนูจากตาราง menus
         const menuPriceResult = await client.query('SELECT price FROM menus WHERE menu_id = $1', [menu_id]);
         if (menuPriceResult.rows.length === 0) {
           throw new Error(`Menu item with ID ${menu_id} not found during order item update.`);
         }
         const priceAtOrder = menuPriceResult.rows[0].price;
 
-        // แทรก order_item ใหม่ พร้อม item_status
         await client.query(`
           INSERT INTO order_items (order_id, menu_id, quantity, price_at_order, notes, item_status)
           VALUES ($1, $2, $3, $4, $5, $6);
-        `, [order_id, menu_id, quantity, priceAtOrder, notes || null, item_status || 'pending']); // กำหนดค่าเริ่มต้นเป็น 'pending' หากไม่ได้ระบุ
+        `, [order_id, menu_id, quantity, priceAtOrder, notes || null, item_status || 'pending']);
 
         recalculatedTotalAmount += priceAtOrder * quantity;
       }
 
-      // อัปเดต total_amount ใน Order หลักอีกครั้งหลังจากอัปเดต order_items
       await client.query(
         'UPDATE orders SET total_amount = $1 WHERE order_id = $2',
         [recalculatedTotalAmount, order_id]
       );
     }
 
-    await client.query('COMMIT'); // Commit transaction
+    await client.query('COMMIT');
 
-    // ดึงข้อมูล order ที่อัปเดตล่าสุดพร้อมรายการอาหารเพื่อส่งกลับ
     const updatedOrderResult = await client.query(`
       SELECT
         o.order_id,
@@ -538,7 +633,7 @@ app.put('/api/orders/:order_id', async (req, res) => {
         o.order_time,
         o.status,
         o.total_amount,
-        o.bill_requested,    -- ดึง bill_requested ด้วย
+        o.bill_requested,
         t.table_number,
         t.qr_code_path,
         t.capacity,
@@ -572,16 +667,16 @@ app.put('/api/orders/:order_id', async (req, res) => {
     res.status(200).json(updatedOrder);
 
   } catch (err) {
-    await client.query('ROLLBACK'); // Rollback transaction หากเกิด error
+    await client.query('ROLLBACK');
     console.error(`Error updating order with ID ${order_id}:`, err.message);
     res.status(500).json({ error: 'Failed to update order', details: err.message });
   } finally {
-    client.release(); // ปล่อย client กลับไปที่ pool
+    client.release();
   }
 });
 
-// PUT: อัปเดตสถานะออเดอร์โดยเฉพาะ
-app.put('/api/orders/:order_id/status', async (req, res) => {
+// PUT: อัปเดตสถานะออเดอร์โดยเฉพาะ (Owner, Waiter)
+app.put('/api/orders/:order_id/status', authenticateToken, authorizeRoles(['owner', 'waiter']), async (req, res) => {
   const { order_id } = req.params;
   const { status } = req.body;
 
@@ -606,12 +701,11 @@ app.put('/api/orders/:order_id/status', async (req, res) => {
   }
 });
 
-// PUT: อัปเดตสถานะการเรียกบิล (bill_requested)
-app.put('/api/orders/:order_id/bill_request', async (req, res) => {
+// PUT: อัปเดตสถานะการเรียกบิล (bill_requested) (Waiter)
+app.put('/api/orders/:order_id/bill_request', authenticateToken, authorizeRoles(['waiter']), async (req, res) => {
     const { order_id } = req.params;
-    const { requested } = req.body; // boolean true/false
+    const { requested } = req.body;
 
-    // ตรวจสอบค่า requested ต้องเป็น boolean
     if (typeof requested !== 'boolean') {
         return res.status(400).json({ error: 'Invalid value for "requested". Must be true or false.' });
     }
@@ -632,48 +726,36 @@ app.put('/api/orders/:order_id/bill_request', async (req, res) => {
 });
 
 
-// DELETE: ลบข้อมูลออเดอร์
-app.delete('/api/orders/:order_id', async (req, res) => {
-  const { order_id } = req.params; // ID ของออเดอร์จาก URL
+// DELETE: ลบข้อมูลออเดอร์ (Owner only)
+app.delete('/api/orders/:order_id', authenticateToken, authorizeRoles(['owner']), async (req, res) => {
+  const { order_id } = req.params;
 
-  const client = await pool.connect(); // ใช้ client เพื่อทำ Transaction
+  const client = await pool.connect();
   try {
-    await client.query('BEGIN'); // เริ่ม Transaction
+    await client.query('BEGIN');
 
-    // 1. ลบรายการอาหารทั้งหมดที่เกี่ยวข้องกับออเดอร์นี้ในตาราง 'order_items' ก่อน
-    // เนื่องจาก order_items มี Foreign Key ไปยัง orders, ต้องลบ order_items ก่อน
     await client.query('DELETE FROM order_items WHERE order_id = $1', [order_id]);
-
-    // 2. ลบการชำระเงินทั้งหมดที่เกี่ยวข้องกับออเดอร์นี้ในตาราง 'payments' ก่อน
-    // เนื่องจาก payments มี Foreign Key ไปยัง orders, ต้องลบ payments ก่อน
     await client.query('DELETE FROM payments WHERE order_id = $1', [order_id]);
 
-    // 3. ลบออเดอร์หลักจากตาราง 'orders'
     const deleteOrderResult = await client.query('DELETE FROM orders WHERE order_id = $1 RETURNING *', [order_id]);
 
-    // ถ้าไม่พบออเดอร์หลักที่มี ID นั้นใน Database
     if (deleteOrderResult.rows.length === 0) {
-      await client.query('ROLLBACK'); // ยกเลิกการลบ order_items และ payments ที่อาจเกิดขึ้น
+      await client.query('ROLLBACK');
       return res.status(404).json({ error: 'Order not found for deletion.' });
     }
 
-    // (Optional) ตั้งค่า is_occupied ของโต๊ะกลับเป็น FALSE หากออเดอร์นี้เป็นออเดอร์เดียวที่โต๊ะนั้นใช้
-    // ต้องดึง table_id จาก order ที่เพิ่งลบไป
     const tableId = deleteOrderResult.rows[0].table_id;
-    // ตรวจสอบว่ามีออเดอร์อื่นใช้ table_id นี้อยู่หรือไม่
     const remainingOrders = await client.query('SELECT order_id FROM orders WHERE table_id = $1', [tableId]);
     if (remainingOrders.rows.length === 0) {
-        await client.query('UPDATE tables SET is_occupied = FALSE WHERE table_id = $1', [tableId]);
+        await client.query('UPDATE tables SET is_occupied = FALSE, current_order_id = NULL WHERE table_id = $1', [tableId]);
     }
 
+    await client.query('COMMIT');
 
-    await client.query('COMMIT'); // ยืนยัน Transaction
-
-    // ส่ง Status 200 OK พร้อมข้อความยืนยัน
     res.status(200).json({ message: `Order with ID ${order_id} and its associated items/payments deleted successfully.` });
 
   } catch (err) {
-    await client.query('ROLLBACK'); // ยกเลิก Transaction หากมี Error
+    await client.query('ROLLBACK');
     console.error('Error deleting order:', err.message);
     res.status(500).json({ error: 'Failed to delete order.', details: err.message });
   } finally {
@@ -683,17 +765,17 @@ app.delete('/api/orders/:order_id', async (req, res) => {
 
 
 //----------------------------------------------------
-// 5. API Endpoints สำหรับจัดการรายการอาหารในออเดอร์ (Order Items)
-//    - GET /api/order_items: ดึงข้อมูลรายการอาหารในออเดอร์ทั้งหมด
-//    - GET /api/order_items/:order_item_id: ดึงข้อมูลรายการอาหารในออเดอร์ตาม ID
-//    - POST /api/order_items: เพิ่มรายการอาหารในออเดอร์ที่มีอยู่แล้ว (ถ้าจำเป็น)
-//    - PUT /api/order_items/:order_item_id: อัปเดตข้อมูลรายการอาหารในออเดอร์
-//    - PUT /api/order_items/:order_item_id/status: อัปเดตสถานะของรายการอาหารแต่ละชิ้น
-//    - DELETE /api/order_items/:order_item_id: ลบข้อมูลรายการอาหารในออเดอร์
+// 6. API Endpoints สำหรับจัดการรายการอาหารในออเดอร์ (Order Items)
+//    - GET /api/order_items: ดึงข้อมูลรายการอาหารในออเดอร์ทั้งหมด (Owner, Chef, Waiter)
+//    - GET /api/order_items/:order_item_id: ดึงข้อมูลรายการอาหารในออเดอร์ตาม ID (Owner, Chef, Waiter)
+//    - POST /api/order_items: เพิ่มรายการอาหารในออเดอร์ที่มีอยู่แล้ว (Owner, Waiter)
+//    - PUT /api/order_items/:order_item_id: อัปเดตข้อมูลรายการอาหารในออเดอร์ (Owner, Chef, Waiter)
+//    - PUT /api/order_items/:order_item_id/status: อัปเดตสถานะของรายการอาหารแต่ละชิ้น (Chef, Waiter)
+//    - DELETE /api/order_items/:order_item_id: ลบข้อมูลรายการอาหารในออเดอร์ (Owner, Waiter)
 //----------------------------------------------------
 
-// GET: ดึงข้อมูลรายการอาหารในออเดอร์ทั้งหมด
-app.get('/api/order_items', async (req, res) => {
+// GET: ดึงข้อมูลรายการอาหารในออเดอร์ทั้งหมด (Owner, Chef, Waiter)
+app.get('/api/order_items', authenticateToken, authorizeRoles(['owner', 'chef', 'waiter']), async (req, res) => {
   try {
     const result = await pool.query(`
       SELECT
@@ -717,8 +799,8 @@ app.get('/api/order_items', async (req, res) => {
   }
 });
 
-// GET: ดึงข้อมูลรายการอาหารในออเดอร์ตาม ID
-app.get('/api/order_items/:order_item_id', async (req, res) => {
+// GET: ดึงข้อมูลรายการอาหารในออเดอร์ตาม ID (Owner, Chef, Waiter)
+app.get('/api/order_items/:order_item_id', authenticateToken, authorizeRoles(['owner', 'chef', 'waiter']), async (req, res) => {
   const { order_item_id } = req.params;
   try {
     const result = await pool.query(`
@@ -746,27 +828,24 @@ app.get('/api/order_items/:order_item_id', async (req, res) => {
   }
 });
 
-// POST: เพิ่มรายการอาหารในออเดอร์ที่มีอยู่แล้ว (ถ้าจำเป็นต้องเพิ่มทีหลัง)
-app.post('/api/order_items', async (req, res) => {
+// POST: เพิ่มรายการอาหารในออเดอร์ที่มีอยู่แล้ว (Owner, Waiter)
+app.post('/api/order_items', authenticateToken, authorizeRoles(['owner', 'waiter']), async (req, res) => {
     const { order_id, menu_id, quantity, notes } = req.body;
 
-    // ตรวจสอบค่าที่จำเป็น
     if (!order_id || !menu_id || !quantity || typeof quantity !== 'number' || quantity <= 0) {
         return res.status(400).json({ error: 'Order ID, menu ID, and positive quantity are required.' });
     }
 
     const client = await pool.connect();
     try {
-        await client.query('BEGIN'); // เริ่ม transaction
+        await client.query('BEGIN');
 
-        // ตรวจสอบว่า order_id มีอยู่จริง
-        const orderExists = await client.query('SELECT order_id FROM orders WHERE order_id = $1 FOR UPDATE', [order_id]); // FOR UPDATE เพื่อ lock row ป้องกันการแก้ไขพร้อมกัน
+        const orderExists = await client.query('SELECT order_id FROM orders WHERE order_id = $1 FOR UPDATE', [order_id]);
         if (orderExists.rows.length === 0) {
             await client.query('ROLLBACK');
             return res.status(400).json({ error: 'Invalid order_id.', details: 'Order does not exist.' });
         }
 
-        // ดึงราคาเมนูจากตาราง menus
         const menuResult = await client.query('SELECT price FROM menus WHERE menu_id = $1', [menu_id]);
         if (menuResult.rows.length === 0) {
             await client.query('ROLLBACK');
@@ -774,24 +853,22 @@ app.post('/api/order_items', async (req, res) => {
         }
         const priceAtOrder = menuResult.rows[0].price;
 
-        // แทรกรายการอาหารใหม่ พร้อม item_status
         const result = await client.query(`
             INSERT INTO order_items (order_id, menu_id, quantity, price_at_order, notes, item_status)
             VALUES ($1, $2, $3, $4, $5, $6)
             RETURNING *;
-        `, [order_id, menu_id, quantity, priceAtOrder, notes || null, 'pending']); // กำหนด item_status เริ่มต้นเป็น 'pending'
+        `, [order_id, menu_id, quantity, priceAtOrder, notes || null, 'pending']);
 
-        // อัปเดต total_amount ในตาราง orders
         await client.query(
             'UPDATE orders SET total_amount = total_amount + ($1::NUMERIC * $2::NUMERIC) WHERE order_id = $3',
             [priceAtOrder, quantity, order_id]
         );
 
-        await client.query('COMMIT'); // Commit transaction
+        await client.query('COMMIT');
         res.status(201).json(result.rows[0]);
 
     } catch (err) {
-        await client.query('ROLLBACK'); // Rollback transaction หากเกิด error
+        await client.query('ROLLBACK');
         console.error('Error adding order item:', err.message);
         res.status(500).json({ error: 'Failed to add order item', details: err.message });
     } finally {
@@ -799,16 +876,15 @@ app.post('/api/order_items', async (req, res) => {
     }
 });
 
-// PUT: อัปเดตข้อมูลรายการอาหารในออเดอร์
-app.put('/api/order_items/:order_item_id', async (req, res) => {
+// PUT: อัปเดตข้อมูลรายการอาหารในออเดอร์ (Owner, Chef, Waiter)
+app.put('/api/order_items/:order_item_id', authenticateToken, authorizeRoles(['owner', 'chef', 'waiter']), async (req, res) => {
   const { order_item_id } = req.params;
-  const { order_id, menu_id, quantity, notes, item_status } = req.body; // เพิ่ม item_status
+  const { order_id, menu_id, quantity, notes, item_status } = req.body;
 
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
 
-    // ดึงข้อมูล order_item เดิมเพื่อคำนวณ total_amount ใหม่
     const oldOrderItemResult = await client.query('SELECT order_id, menu_id, quantity, price_at_order, item_status FROM order_items WHERE order_item_id = $1 FOR UPDATE', [order_item_id]);
     if (oldOrderItemResult.rows.length === 0) {
       await client.query('ROLLBACK');
@@ -817,8 +893,8 @@ app.put('/api/order_items/:order_item_id', async (req, res) => {
     const oldOrderItem = oldOrderItemResult.rows[0];
     const oldTotalItemPrice = oldOrderItem.price_at_order * oldOrderItem.quantity;
 
-    let newPriceAtOrder = oldOrderItem.price_at_order; // ใช้ราคาเดิมเป็นค่าเริ่มต้น
-    if (menu_id && menu_id !== oldOrderItem.menu_id) { // ถ้ามีการเปลี่ยน menu_id ให้ดึงราคาใหม่
+    let newPriceAtOrder = oldOrderItem.price_at_order;
+    if (menu_id && menu_id !== oldOrderItem.menu_id) {
       const newMenuPriceResult = await client.query('SELECT price FROM menus WHERE menu_id = $1', [menu_id]);
       if (newMenuPriceResult.rows.length === 0) {
         await client.query('ROLLBACK');
@@ -830,21 +906,19 @@ app.put('/api/order_items/:order_item_id', async (req, res) => {
     const newQuantity = quantity !== undefined ? quantity : oldOrderItem.quantity;
     const newTotalItemPrice = newPriceAtOrder * newQuantity;
 
-    // อัปเดต order_item
     const updateResult = await client.query(`
       UPDATE order_items
       SET
         order_id = COALESCE($1, order_id),
         menu_id = COALESCE($2, menu_id),
         quantity = COALESCE($3, quantity),
-        price_at_order = COALESCE($4, price_at_order), // สามารถอัปเดตราคาได้ถ้าต้องการ
+        price_at_order = COALESCE($4, price_at_order),
         notes = COALESCE($5, notes),
-        item_status = COALESCE($6, item_status) -- อัปเดต item_status
+        item_status = COALESCE($6, item_status)
       WHERE order_item_id = $7
       RETURNING *;
     `, [order_id, menu_id, newQuantity, newPriceAtOrder, notes, item_status, order_item_id]);
 
-    // อัปเดต total_amount ในตาราง orders
     const orderToUpdateId = order_id || oldOrderItem.order_id;
     await client.query(
       'UPDATE orders SET total_amount = total_amount - ($1::NUMERIC) + ($2::NUMERIC) WHERE order_id = $3',
@@ -862,8 +936,8 @@ app.put('/api/order_items/:order_item_id', async (req, res) => {
   }
 });
 
-// PUT: อัปเดตสถานะของรายการอาหารแต่ละชิ้น
-app.put('/api/order_items/:order_item_id/status', async (req, res) => {
+// PUT: อัปเดตสถานะของรายการอาหารแต่ละชิ้น (Chef, Waiter)
+app.put('/api/order_items/:order_item_id/status', authenticateToken, authorizeRoles(['chef', 'waiter']), async (req, res) => {
     const { order_item_id } = req.params;
     const { status } = req.body;
 
@@ -882,24 +956,11 @@ app.put('/api/order_items/:order_item_id/status', async (req, res) => {
             return res.status(404).json({ error: 'Order item not found for status update.' });
         }
 
-        // ตรวจสอบว่าทุกรายการในออเดอร์เดียวกันพร้อมเสิร์ฟหรือเสิร์ฟแล้ว
         const orderId = result.rows[0].order_id;
         const allItemsServedOrReady = await pool.query(
             "SELECT COUNT(*) FROM order_items WHERE order_id = $1 AND item_status NOT IN ('served', 'cancelled')",
             [orderId]
         );
-
-        // ถ้าไม่มีรายการอาหารที่ยังไม่เสิร์ฟหรือยกเลิกแล้ว (นั่นคือทุกรายการเสิร์ฟแล้วหรือยกเลิกแล้ว)
-        if (parseInt(allItemsServedOrReady.rows[0].count) === 0) {
-            // อัปเดตสถานะของออเดอร์หลักเป็น 'completed'
-            // NOTE: This logic might conflict with payment status.
-            // We'll rely on payment status to set order to 'completed' for finality.
-            // So, removing this auto-completion based on item status.
-            // await pool.query(
-            //     "UPDATE orders SET status = 'completed' WHERE order_id = $1 AND status != 'completed'",
-            //     [orderId]
-            // );
-        }
 
         res.status(200).json(result.rows[0]);
     } catch (err) {
@@ -909,14 +970,13 @@ app.put('/api/order_items/:order_item_id/status', async (req, res) => {
 });
 
 
-// DELETE: ลบข้อมูลรายการอาหารในออเดอร์
-app.delete('/api/order_items/:order_item_id', async (req, res) => {
+// DELETE: ลบข้อมูลรายการอาหารในออเดอร์ (Owner, Waiter)
+app.delete('/api/order_items/:order_item_id', authenticateToken, authorizeRoles(['owner', 'waiter']), async (req, res) => {
   const { order_item_id } = req.params;
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
 
-    // ดึงข้อมูล order_item ที่จะลบเพื่ออัปเดต total_amount ของ order หลัก
     const orderItemToDeleteResult = await client.query('SELECT order_id, quantity, price_at_order FROM order_items WHERE order_item_id = $1 FOR UPDATE', [order_item_id]);
     if (orderItemToDeleteResult.rows.length === 0) {
       await client.query('ROLLBACK');
@@ -925,10 +985,8 @@ app.delete('/api/order_items/:order_item_id', async (req, res) => {
     const orderItemToDelete = orderItemToDeleteResult.rows[0];
     const itemTotalPrice = orderItemToDelete.quantity * orderItemToDelete.price_at_order;
 
-    // ลบ order_item
     const deleteResult = await client.query('DELETE FROM order_items WHERE order_item_id = $1 RETURNING *;', [order_item_id]);
 
-    // อัปเดต total_amount ของ order หลัก
     await client.query(
       'UPDATE orders SET total_amount = total_amount - ($1::NUMERIC) WHERE order_id = $2',
       [itemTotalPrice, orderItemToDelete.order_id]
@@ -947,16 +1005,16 @@ app.delete('/api/order_items/:order_item_id', async (req, res) => {
 
 
 //----------------------------------------------------
-// 6. API Endpoints สำหรับจัดการการชำระเงิน (Payments)
-//    - GET /api/payments: ดึงข้อมูลการชำระเงินทั้งหมด
-//    - GET /api/payments/:payment_id: ดึงข้อมูลการชำระเงินตาม ID
-//    - POST /api/payments: บันทึกการชำระเงิน
-//    - PUT /api/payments/:payment_id: อัปเดตข้อมูลการชำระเงิน
-//    - DELETE /api/payments/:payment_id: ลบข้อมูลการชำระเงิน
+// 7. API Endpoints สำหรับจัดการการชำระเงิน (Payments)
+//    - GET /api/payments: ดึงข้อมูลการชำระเงินทั้งหมด (Owner, Waiter)
+//    - GET /api/payments/:payment_id: ดึงข้อมูลการชำระเงินตาม ID (Owner, Waiter)
+//    - POST /api/payments: บันทึกการชำระเงิน (Waiter)
+//    - PUT /api/payments/:payment_id: อัปเดตข้อมูลการชำระเงิน (Owner, Waiter)
+//    - DELETE /api/payments/:payment_id: ลบข้อมูลการชำระเงิน (Owner)
 //----------------------------------------------------
 
-// GET: ดึงข้อมูลการชำระเงินทั้งหมด
-app.get('/api/payments', async (req, res) => {
+// GET: ดึงข้อมูลการชำระเงินทั้งหมด (Owner, Waiter)
+app.get('/api/payments', authenticateToken, authorizeRoles(['owner', 'waiter']), async (req, res) => {
   try {
     const result = await pool.query('SELECT * FROM payments ORDER BY payment_date DESC');
     res.status(200).json(result.rows);
@@ -966,8 +1024,8 @@ app.get('/api/payments', async (req, res) => {
   }
 });
 
-// GET: ดึงข้อมูลการชำระเงินตาม ID
-app.get('/api/payments/:payment_id', async (req, res) => {
+// GET: ดึงข้อมูลการชำระเงินตาม ID (Owner, Waiter)
+app.get('/api/payments/:payment_id', authenticateToken, authorizeRoles(['owner', 'waiter']), async (req, res) => {
   const { payment_id } = req.params;
   try {
     const result = await pool.query('SELECT * FROM payments WHERE payment_id = $1', [payment_id]);
@@ -981,48 +1039,44 @@ app.get('/api/payments/:payment_id', async (req, res) => {
   }
 });
 
-// POST: บันทึกการชำระเงิน
-app.post('/api/payments', async (req, res) => {
+// POST: บันทึกการชำระเงิน (Waiter)
+app.post('/api/payments', authenticateToken, authorizeRoles(['waiter']), async (req, res) => {
   const { order_id, amount, payment_method, transaction_id, status } = req.body;
 
-  // ตรวจสอบค่าที่จำเป็น
   if (!order_id || !amount || typeof amount !== 'number' || amount <= 0 || !payment_method) {
       return res.status(400).json({ error: 'Order ID, amount, and payment method are required.' });
   }
 
   const client = await pool.connect();
   try {
-    await client.query('BEGIN'); // เริ่ม transaction
+    await client.query('BEGIN');
 
-    // ตรวจสอบว่า order_id มีอยู่จริง
-    const orderCheck = await client.query('SELECT table_id FROM orders WHERE order_id = $1 FOR UPDATE', [order_id]); // FOR UPDATE เพื่อ lock row
+    const orderCheck = await client.query('SELECT table_id FROM orders WHERE order_id = $1 FOR UPDATE', [order_id]);
     if (orderCheck.rows.length === 0) {
       await client.query('ROLLBACK');
       return res.status(400).json({ error: 'Invalid order_id.', details: 'Order does not exist.' });
     }
-    const tableId = orderCheck.rows[0].table_id; // ดึง table_id จาก order เพื่อนำไปอัปเดตสถานะโต๊ะ
+    const tableId = orderCheck.rows[0].table_id;
 
-    // แทรกข้อมูลการชำระเงิน
     const result = await client.query(`
       INSERT INTO payments (order_id, amount, payment_method, transaction_id, payment_date, status)
       VALUES ($1, $2, $3, $4, NOW(), $5)
       RETURNING *;
-    `, [order_id, amount, payment_method, transaction_id || null, status || 'completed']); // กำหนดค่าเริ่มต้น status เป็น 'completed'
+    `, [order_id, amount, payment_method, transaction_id || null, status || 'completed']);
 
-    // หากสถานะ payment เป็น 'completed' ให้อัปเดตสถานะ order และ table
     if (result.rows[0].status === 'completed') {
         await client.query(
             'UPDATE orders SET status = $1 WHERE order_id = $2',
             ['completed', order_id]
         );
-        await client.query('UPDATE tables SET is_occupied = FALSE WHERE table_id = $1', [tableId]);
+        await client.query('UPDATE tables SET is_occupied = FALSE, current_order_id = NULL WHERE table_id = $1', [tableId]);
     }
 
-    await client.query('COMMIT'); // Commit transaction
+    await client.query('COMMIT');
     res.status(201).json(result.rows[0]);
 
   } catch (err) {
-    await client.query('ROLLBACK'); // Rollback transaction หากเกิด error
+    await client.query('ROLLBACK');
     console.error('Error processing payment:', err.message);
     res.status(500).json({ error: 'Failed to process payment', details: err.message });
   } finally {
@@ -1030,8 +1084,8 @@ app.post('/api/payments', async (req, res) => {
   }
 });
 
-// PUT: อัปเดตข้อมูลการชำระเงิน
-app.put('/api/payments/:payment_id', async (req, res) => {
+// PUT: อัปเดตข้อมูลการชำระเงิน (Owner, Waiter)
+app.put('/api/payments/:payment_id', authenticateToken, authorizeRoles(['owner', 'waiter']), async (req, res) => {
   const { payment_id } = req.params;
   const { order_id, amount, payment_method, transaction_id, status } = req.body;
 
@@ -1039,16 +1093,14 @@ app.put('/api/payments/:payment_id', async (req, res) => {
   try {
     await client.query('BEGIN');
 
-    // ดึงข้อมูล payment เดิมเพื่อหา order_id และ table_id
     const oldPaymentResult = await client.query('SELECT order_id, status FROM payments WHERE payment_id = $1 FOR UPDATE', [payment_id]);
     if (oldPaymentResult.rows.length === 0) {
         await client.query('ROLLBACK');
         return res.status(404).json({ error: 'Payment not found for update.' });
     }
     const oldPayment = oldPaymentResult.rows[0];
-    const targetOrderId = order_id || oldPayment.order_id; // ใช้ order_id ใหม่ถ้ามี หรือใช้ของเดิม
+    const targetOrderId = order_id || oldPayment.order_id;
 
-    // ดึง table_id จาก order ที่เกี่ยวข้อง
     const orderResult = await client.query('SELECT table_id FROM orders WHERE order_id = $1', [targetOrderId]);
     if (orderResult.rows.length === 0) {
         await client.query('ROLLBACK');
@@ -1056,7 +1108,6 @@ app.put('/api/payments/:payment_id', async (req, res) => {
     }
     const tableId = orderResult.rows[0].table_id;
 
-    // อัปเดต payment
     const result = await pool.query(`
       UPDATE payments
       SET
@@ -1074,18 +1125,13 @@ app.put('/api/payments/:payment_id', async (req, res) => {
       return res.status(404).json({ error: 'Payment not found for update.' });
     }
 
-    // หากสถานะ payment ถูกเปลี่ยนเป็น 'completed' (และสถานะเดิมไม่ใช่ 'completed')
-    // ให้อัปเดตสถานะ order และ table
     if (result.rows[0].status === 'completed' && oldPayment.status !== 'completed') {
         await client.query(
             'UPDATE orders SET status = $1 WHERE order_id = $2',
             ['completed', targetOrderId]
         );
-        await client.query('UPDATE tables SET is_occupied = FALSE WHERE table_id = $1', [tableId]);
+        await client.query('UPDATE tables SET is_occupied = FALSE, current_order_id = NULL WHERE table_id = $1', [tableId]);
     }
-    // หากสถานะ payment ถูกเปลี่ยนจาก 'completed' เป็นอย่างอื่น
-    // อาจจะต้องพิจารณาเปลี่ยนสถานะ order และ table กลับ (กรณีซับซ้อน)
-    // สำหรับตอนนี้ เราจะเน้นแค่การเปลี่ยนเป็น 'completed' เท่านั้น
 
     await client.query('COMMIT');
     res.status(200).json(result.rows[0]);
@@ -1098,9 +1144,8 @@ app.put('/api/payments/:payment_id', async (req, res) => {
   }
 });
 
-// DELETE: ลบข้อมูลการชำระเงิน
-app.delete('/api/payments/:payment_id', async (req, res) => {
-  const { payment_id } = req.params;
+// DELETE: ลบข้อมูลการชำระเงิน (Owner only)
+app.delete('/api/payments/:payment_id', authenticateToken, authorizeRoles(['owner']), async (req, res) => {
   try {
     const result = await pool.query('DELETE FROM payments WHERE payment_id = $1 RETURNING *;', [payment_id]);
     if (result.rows.length === 0) {
@@ -1117,7 +1162,7 @@ app.delete('/api/payments/:payment_id', async (req, res) => {
 //----------------------------------------------------
 // Server Listener
 //----------------------------------------------------
-const PORT = process.env.PORT || 5000; // ใช้ค่าจาก .env (ถ้ามี) หรือใช้ 5000 เป็นค่าเริ่มต้น
+const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
   console.log(`Server is running on port ${PORT}`);
 });
