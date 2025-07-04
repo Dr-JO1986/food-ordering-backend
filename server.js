@@ -298,8 +298,9 @@ app.delete('/api/tables/:table_id', async (req, res) => {
 //    - GET /api/orders: ดึงข้อมูลออเดอร์ทั้งหมดพร้อมรายละเอียดโต๊ะ
 //    - GET /api/orders/:order_id: ดึงข้อมูลออเดอร์ตาม ID พร้อมรายการอาหารและโต๊ะ
 //    - POST /api/orders: สร้างออเดอร์ใหม่พร้อมรายการอาหาร
-//    - PUT /api/orders/:order_id: อัปเดตข้อมูลออเดอร์ทั่วไปและรายการอาหาร (ใหม่)
+//    - PUT /api/orders/:order_id: อัปเดตข้อมูลออเดอร์ทั่วไป
 //    - PUT /api/orders/:order_id/status: อัปเดตสถานะออเดอร์
+//    - PUT /api/orders/:order_id/bill_request: อัปเดตสถานะการเรียกบิล (ใหม่)
 //    - DELETE /api/orders/:order_id: ลบข้อมูลออเดอร์
 //----------------------------------------------------
 
@@ -313,6 +314,7 @@ app.get('/api/orders', async (req, res) => {
         o.order_time,
         o.status,
         o.total_amount,
+        o.bill_requested,    -- ดึง bill_requested ด้วย
         t.table_number,
         t.qr_code_path,
         t.capacity,
@@ -340,6 +342,7 @@ app.get('/api/orders/:order_id', async (req, res) => {
         o.order_time,
         o.status,
         o.total_amount,
+        o.bill_requested,    -- ดึง bill_requested ด้วย
         t.table_number,
         t.qr_code_path,
         t.capacity,
@@ -366,7 +369,7 @@ app.get('/api/orders/:order_id', async (req, res) => {
         oi.quantity,
         oi.price_at_order,
         oi.notes,
-        oi.item_status -- ดึง item_status ที่เพิ่มเข้ามา
+        oi.item_status
       FROM order_items oi
       JOIN menus m ON oi.menu_id = m.menu_id
       WHERE oi.order_id = $1
@@ -398,8 +401,8 @@ app.post('/api/orders', async (req, res) => {
 
     // 1. สร้าง Order หลัก
     const orderResult = await client.query(
-      'INSERT INTO orders (table_id, customer_name, order_time, status, total_amount) VALUES ($1, $2, NOW(), $3, $4) RETURNING order_id, order_time',
-      [table_id, customer_name || 'Guest', 'pending', 0] // total_amount เริ่มต้นเป็น 0
+      'INSERT INTO orders (table_id, customer_name, order_time, status, total_amount, bill_requested) VALUES ($1, $2, NOW(), $3, $4, $5) RETURNING order_id, order_time',
+      [table_id, customer_name || 'Guest', 'pending', 0, false] // bill_requested เริ่มต้นเป็น false
     );
     const orderId = orderResult.rows[0].order_id;
     let totalAmount = 0;
@@ -461,7 +464,7 @@ app.post('/api/orders', async (req, res) => {
 // PUT: อัปเดตข้อมูลออเดอร์ทั่วไปและรายการอาหาร
 app.put('/api/orders/:order_id', async (req, res) => {
   const { order_id } = req.params;
-  const { table_id, customer_name, status, total_amount, order_items } = req.body; // เพิ่ม order_items
+  const { table_id, customer_name, status, total_amount, order_items, bill_requested } = req.body; // เพิ่ม order_items และ bill_requested
 
   const client = await pool.connect();
   try {
@@ -475,11 +478,12 @@ app.put('/api/orders/:order_id', async (req, res) => {
         table_id = COALESCE($1, table_id),
         customer_name = COALESCE($2, customer_name),
         status = COALESCE($3, status),
-        total_amount = COALESCE($4, total_amount)
-      WHERE order_id = $5
+        total_amount = COALESCE($4, total_amount),
+        bill_requested = COALESCE($5, bill_requested) -- อัปเดต bill_requested
+      WHERE order_id = $6
       RETURNING *;
     `;
-    const orderResult = await client.query(updateOrderQuery, [table_id, customer_name, status, total_amount, order_id]);
+    const orderResult = await client.query(updateOrderQuery, [table_id, customer_name, status, total_amount, bill_requested, order_id]);
 
     if (orderResult.rows.length === 0) {
       await client.query('ROLLBACK');
@@ -534,6 +538,7 @@ app.put('/api/orders/:order_id', async (req, res) => {
         o.order_time,
         o.status,
         o.total_amount,
+        o.bill_requested,    -- ดึง bill_requested ด้วย
         t.table_number,
         t.qr_code_path,
         t.capacity,
@@ -555,7 +560,7 @@ app.put('/api/orders/:order_id', async (req, res) => {
         oi.quantity,
         oi.price_at_order,
         oi.notes,
-        oi.item_status -- ดึง item_status ที่เพิ่มเข้ามา
+        oi.item_status
       FROM order_items oi
       JOIN menus m ON oi.menu_id = m.menu_id
       WHERE oi.order_id = $1
@@ -600,6 +605,32 @@ app.put('/api/orders/:order_id/status', async (req, res) => {
     res.status(500).json({ error: 'Failed to update order status', details: err.message });
   }
 });
+
+// PUT: อัปเดตสถานะการเรียกบิล (bill_requested)
+app.put('/api/orders/:order_id/bill_request', async (req, res) => {
+    const { order_id } = req.params;
+    const { requested } = req.body; // boolean true/false
+
+    // ตรวจสอบค่า requested ต้องเป็น boolean
+    if (typeof requested !== 'boolean') {
+        return res.status(400).json({ error: 'Invalid value for "requested". Must be true or false.' });
+    }
+
+    try {
+        const result = await pool.query(
+            'UPDATE orders SET bill_requested = $1 WHERE order_id = $2 RETURNING *',
+            [requested, order_id]
+        );
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: 'Order not found.' });
+        }
+        res.status(200).json(result.rows[0]);
+    } catch (err) {
+        console.error(`Error updating bill request status for order ID ${order_id}:`, err.message);
+        res.status(500).json({ error: 'Failed to update bill request status', details: err.message });
+    }
+});
+
 
 // DELETE: ลบข้อมูลออเดอร์
 app.delete('/api/orders/:order_id', async (req, res) => {
@@ -657,7 +688,7 @@ app.delete('/api/orders/:order_id', async (req, res) => {
 //    - GET /api/order_items/:order_item_id: ดึงข้อมูลรายการอาหารในออเดอร์ตาม ID
 //    - POST /api/order_items: เพิ่มรายการอาหารในออเดอร์ที่มีอยู่แล้ว (ถ้าจำเป็น)
 //    - PUT /api/order_items/:order_item_id: อัปเดตข้อมูลรายการอาหารในออเดอร์
-//    - PUT /api/order_items/:order_item_id/status: อัปเดตสถานะของรายการอาหารแต่ละชิ้น (ใหม่)
+//    - PUT /api/order_items/:order_item_id/status: อัปเดตสถานะของรายการอาหารแต่ละชิ้น
 //    - DELETE /api/order_items/:order_item_id: ลบข้อมูลรายการอาหารในออเดอร์
 //----------------------------------------------------
 
@@ -674,7 +705,7 @@ app.get('/api/order_items', async (req, res) => {
         oi.quantity,
         oi.price_at_order,
         oi.notes,
-        oi.item_status -- ดึง item_status ที่เพิ่มเข้ามา
+        oi.item_status
       FROM order_items oi
       JOIN menus m ON oi.menu_id = m.menu_id
       ORDER BY oi.order_id, oi.order_item_id ASC;
@@ -700,7 +731,7 @@ app.get('/api/order_items/:order_item_id', async (req, res) => {
         oi.quantity,
         oi.price_at_order,
         oi.notes,
-        oi.item_status -- ดึง item_status ที่เพิ่มเข้ามา
+        oi.item_status
       FROM order_items oi
       JOIN menus m ON oi.menu_id = m.menu_id
       WHERE oi.order_item_id = $1;
@@ -847,9 +878,26 @@ app.put('/api/order_items/:order_item_id/status', async (req, res) => {
             [status, order_item_id]
         );
 
-        if (result.rows.length === 0) {
+        if (!result.rows.length) {
             return res.status(404).json({ error: 'Order item not found for status update.' });
         }
+
+        // ตรวจสอบว่าทุกรายการในออเดอร์เดียวกันพร้อมเสิร์ฟหรือเสิร์ฟแล้ว
+        const orderId = result.rows[0].order_id;
+        const allItemsServedOrReady = await pool.query(
+            "SELECT COUNT(*) FROM order_items WHERE order_id = $1 AND item_status NOT IN ('served', 'cancelled')",
+            [orderId]
+        );
+
+        // ถ้าไม่มีรายการอาหารที่ยังไม่เสิร์ฟหรือยกเลิกแล้ว (นั่นคือทุกรายการเสิร์ฟแล้วหรือยกเลิกแล้ว)
+        if (parseInt(allItemsServedOrReady.rows[0].count) === 0) {
+            // อัปเดตสถานะของออเดอร์หลักเป็น 'completed'
+            await pool.query(
+                "UPDATE orders SET status = 'completed' WHERE order_id = $1 AND status != 'completed'",
+                [orderId]
+            );
+        }
+
         res.status(200).json(result.rows[0]);
     } catch (err) {
         console.error(`Error updating order item status for ID ${order_item_id}:`, err.message);
@@ -886,7 +934,7 @@ app.delete('/api/order_items/:order_item_id', async (req, res) => {
     await client.query('COMMIT');
     res.status(200).json({ message: 'Order item deleted successfully.', deletedOrderItem: deleteResult.rows[0] });
   } catch (err) {
-    await client.query('ROLLback');
+    await client.query('ROLLBACK');
     console.error(`Error deleting order item with ID ${order_item_id}:`, err.message);
     res.status(500).json({ error: 'Failed to delete order item', details: err.message });
   } finally {
@@ -965,7 +1013,7 @@ app.post('/api/payments', async (req, res) => {
     );
 
     // ตั้งค่า is_occupied ของโต๊ะกลับเป็น FALSE หากออเดอร์เสร็จสมบูรณ์และจ่ายเงินแล้ว
-    await client.query('UPDATE tables SET is_occupied = FALSE WHERE table_id = $1', [tableId]);
+    await pool.query('UPDATE tables SET is_occupied = FALSE WHERE table_id = $1', [tableId]); // ใช้ pool.query ได้เลย ไม่จำเป็นต้องใช้ client ใน transaction เดียวกัน
 
     await client.query('COMMIT'); // Commit transaction
     res.status(201).json(result.rows[0]);
